@@ -70,7 +70,9 @@ def strip_mentions(text: str, bot_user: discord.abc.User) -> str:
     Handles both <@id> and <@!id> forms (spec section 8.6).
     """
     pattern = re.compile(rf"<@!?{bot_user.id}>")
-    return pattern.sub("", text).strip()
+    without = pattern.sub("", text)
+    # Collapse the whitespace left where the mention token was removed.
+    return re.sub(r"\s+", " ", without).strip()
 
 
 def split_message(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
