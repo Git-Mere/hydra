@@ -67,7 +67,7 @@ uv run python bot.py
 ```
 DISCORD_TOKEN=your_discord_bot_token
 OPENROUTER_API_KEY=sk-or-xxxxxxxx
-DEFAULT_MODEL=deepseek/deepseek-r1:free   # optional, see below
+DEFAULT_MODEL=meta-llama/llama-3.3-70b-instruct:free   # optional, see below
 ```
 
 Optional OpenRouter attribution headers: set `OPENROUTER_HTTP_REFERER` and

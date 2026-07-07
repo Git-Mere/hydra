@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "channel_config.json")
 
 # Single model used for every channel. Overridable via the DEFAULT_MODEL env
-# var; the constant below is the fallback when it is unset.
-DEFAULT_MODEL = "deepseek/deepseek-r1:free"
+# var; the constant below is the fallback when it is unset. OpenRouter's free
+# tier changes over time, so swap this via DEFAULT_MODEL if the model 400s
+# (e.g. an alternative like "qwen/qwen3-next-80b-a3b-instruct:free").
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 # Allowed values, shared with the slash command choices.
 MODES = ("translate", "chat")
