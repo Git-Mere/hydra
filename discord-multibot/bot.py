@@ -1,11 +1,11 @@
 """Discord multi-bot entrypoint (spec section 3).
 
-One client, many channels. Each channel's behaviour (mode, model, trigger,
-prompt) comes from channels.yaml via config.get_channel_config.
+One client, many channels. Each channel's behaviour (mode, trigger) is set at
+runtime with the ``/setup`` slash command and read via config.get_channel_config.
 
 Flow per incoming message:
     1. ignore the bot's own messages (infinite-loop guard)
-    2. look up channel config by channel_id; no config -> ignore
+    2. look up channel config by (guild_id, channel_id); no config -> ignore
     3. respect enabled: false
     4. trigger check: auto -> all messages, mention -> only when @mentioned
     5. skip empty / whitespace / emoji-only / link-only messages
@@ -20,9 +20,15 @@ import os
 import re
 
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 
-from config import ChannelConfig, get_channel_config
+from config import (
+    ChannelConfig,
+    disable_channel,
+    get_channel_config,
+    set_channel_config,
+)
 from handlers import chat as chat_handler
 from handlers import translate as translate_handler
 from llm.client import USER_FACING_ERROR, LLMError
@@ -114,11 +120,80 @@ intents = discord.Intents.default()
 intents.message_content = True  # required to read message text (spec section 8.2)
 
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+
+@tree.command(name="setup", description="Enable and configure this bot in the current channel.")
+@app_commands.describe(mode="What the bot does here", trigger="When the bot responds")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="translate", value="translate"),
+        app_commands.Choice(name="chat", value="chat"),
+    ],
+    trigger=[
+        app_commands.Choice(name="auto (every message)", value="auto"),
+        app_commands.Choice(name="mention (only when @mentioned)", value="mention"),
+    ],
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def setup_command(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    trigger: app_commands.Choice[str],
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server channel.", ephemeral=True
+        )
+        return
+    set_channel_config(interaction.guild_id, interaction.channel_id, mode.value, trigger.value)
+    await interaction.response.send_message(
+        f"✅ This channel is now **{mode.value}** mode, trigger **{trigger.value}**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="setup-off", description="Disable this bot in the current channel.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def setup_off_command(interaction: discord.Interaction) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server channel.", ephemeral=True
+        )
+        return
+    existed = disable_channel(interaction.guild_id, interaction.channel_id)
+    if existed:
+        msg = "🛑 The bot is now **off** in this channel."
+    else:
+        msg = "The bot was not configured in this channel; nothing to turn off."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "⛔ You need the **Manage Channels** permission to use this command."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+    logger.exception("Unhandled app command error", exc_info=error)
 
 
 @client.event
 async def on_ready() -> None:
     logger.info("Logged in as %s (id=%s)", client.user, client.user.id if client.user else "?")
+    # Guild-scoped sync for instant propagation (global sync can take ~1h).
+    for guild in client.guilds:
+        try:
+            tree.copy_global_to_guild(guild)
+            await tree.sync(guild=guild)
+            logger.info("Synced app commands to guild %s (%s)", guild.name, guild.id)
+        except discord.DiscordException:
+            logger.exception("Failed to sync commands to guild %s", guild.id)
 
 
 @client.event
@@ -127,8 +202,12 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    # 2. Channel config lookup. No config -> not a bot channel, ignore.
-    cfg = get_channel_config(message.channel.id)
+    # 2. Ignore DMs / anything without a guild -- config is keyed by guild.
+    if message.guild is None:
+        return
+
+    # 2b. Channel config lookup. No config -> not a bot channel, ignore.
+    cfg = get_channel_config(message.guild.id, message.channel.id)
     if cfg is None:
         return
 

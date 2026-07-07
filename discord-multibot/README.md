@@ -1,24 +1,26 @@
-# Discord Multi-Bot (Phase 1 MVP)
+# Discord Multi-Bot
 
-One Discord bot that behaves differently **per channel** — different model,
-system prompt, and trigger — all routed through a single
-[OpenRouter](https://openrouter.ai) key.
+One Discord bot that behaves differently **per channel** — different mode and
+trigger — all routed through a single [OpenRouter](https://openrouter.ai) key.
 
-- `#translate` channel: auto-translates every message (Korean ↔ English).
-- `#chat` channel: answers only when the bot is `@mentioned`.
+- **translate** mode: translates messages (Korean ↔ English).
+- **chat** mode: answers questions.
 
-Add a channel by adding one entry to `channels.yaml` — no code change.
+Channels are configured **at runtime** with the `/setup` slash command — no
+file editing, no restart. Config is stored in a local JSON file
+(`channel_config.json`). Every channel uses one shared model (see
+`DEFAULT_MODEL` below).
 
 ## Directory layout
 
 ```
 discord-multibot/
-├── bot.py            # entrypoint: client + on_message flow
-├── config.py         # channels.yaml loader + get_channel_config()
-├── channels.yaml     # per-channel config
+├── bot.py              # entrypoint: client + slash commands + on_message flow
+├── config.py           # JSON config store + get/set/disable_channel_config()
+├── channel_config.json # runtime config (gitignored, created by /setup)
 ├── llm/
-│   ├── client.py     # OpenRouter wrapper (429 backoff, timeout)
-│   └── prompts.py    # TRANSLATE_SYSTEM / CHAT_SYSTEM
+│   ├── client.py       # OpenRouter wrapper (429 backoff, timeout)
+│   └── prompts.py      # TRANSLATE_SYSTEM / CHAT_SYSTEM
 ├── handlers/
 │   ├── translate.py
 │   └── chat.py
@@ -32,8 +34,14 @@ discord-multibot/
 2. **Bot** tab → **Add Bot**. Copy the **token** (goes in `.env` as `DISCORD_TOKEN`).
 3. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**.
    Without this the bot receives empty message content and nothing works.
-4. **OAuth2 → URL Generator**: scope `bot`, permissions `Read Messages/View Channels`,
-   `Send Messages`. Open the generated URL to invite the bot to your server.
+4. **OAuth2 → URL Generator**: select **both** scopes `bot` **and**
+   `applications.commands` (the second is required for slash commands like
+   `/setup` to appear). Permissions: `Read Messages/View Channels`,
+   `Send Messages`. Open the generated URL to invite the bot.
+
+   **If you invited the bot before this version, re-invite it** with the
+   `applications.commands` scope added — otherwise the slash commands will not
+   be registered for your server.
 
 ## 2. Get an OpenRouter key
 
@@ -41,34 +49,10 @@ Sign up at [openrouter.ai](https://openrouter.ai), create an API key
 (`sk-or-...`), and put it in `.env` as `OPENROUTER_API_KEY`.
 
 Free models are rate-limited (roughly 20 req/min and 50 req/day under $10 of
-credit; 1,000 req/day once you've topped up $10). The translate and chat
-channels share the one key, so their limits add up.
+credit; 1,000 req/day once you've topped up $10). All channels share the one
+key, so their limits add up.
 
-## 3. Configure channels
-
-Enable Developer Mode in Discord (User Settings → Advanced), right-click a
-channel → **Copy ID**, and paste the IDs into `channels.yaml`:
-
-```yaml
-channels:
-  "YOUR_TRANSLATE_CHANNEL_ID":
-    mode: translate
-    model: "qwen/qwen-3-8b:free"
-    trigger: auto
-    enabled: true
-  "YOUR_CHAT_CHANNEL_ID":
-    mode: chat
-    model: "deepseek/deepseek-r1:free"
-    trigger: mention
-    enabled: true
-    system_override: null
-```
-
-Fields: `mode` (`translate`|`chat`), `model` (OpenRouter id), `trigger`
-(`auto`|`mention`), `enabled` (`false` disables the channel),
-`system_override` (optional prompt that replaces the default).
-
-## 4. Install and run
+## 3. Install and run
 
 ```bash
 cd discord-multibot
@@ -83,31 +67,70 @@ uv run python bot.py
 ```
 DISCORD_TOKEN=your_discord_bot_token
 OPENROUTER_API_KEY=sk-or-xxxxxxxx
+DEFAULT_MODEL=deepseek/deepseek-r1:free   # optional, see below
 ```
 
 Optional OpenRouter attribution headers: set `OPENROUTER_HTTP_REFERER` and
 `OPENROUTER_X_TITLE` in `.env` to identify your app on OpenRouter.
+
+### `DEFAULT_MODEL`
+
+There is no per-channel model. Every channel uses one model, read from the
+`DEFAULT_MODEL` environment variable. If unset, it falls back to the
+`DEFAULT_MODEL` constant in `config.py`.
+
+## 4. Configure channels with `/setup`
+
+In the channel you want the bot to act in, run:
+
+- **`/setup mode:<translate|chat> trigger:<auto|mention>`** — enables the bot
+  in the current channel. Discord shows pickers for `mode` and `trigger`.
+  - `trigger: auto` → the bot responds to every (meaningful) message.
+  - `trigger: mention` → the bot responds only when `@mentioned`.
+- **`/setup-off`** — disables the bot in the current channel.
+
+Both commands reply with an **ephemeral** confirmation (only you see it) and
+require the **Manage Channels** permission. Members without it get an ephemeral
+"you need Manage Channels permission" reply. This is enforced server-side, not
+just hidden in the UI.
+
+Config is written to `channel_config.json` (keyed by guild → channel) with an
+atomic write on every change, and loaded into memory at startup. The file is
+gitignored — it is runtime data and must not be committed.
+
+Command sync: on startup the bot syncs commands **per guild** for instant
+propagation, so `/setup` is usable immediately after (re-)inviting the bot.
 
 ## 5. Verify
 
 Compile / import checks (no tokens needed):
 
 ```bash
-python -m py_compile bot.py config.py llm/*.py handlers/*.py
-python -c "import bot, config; from llm import client, prompts; from handlers import translate, chat"
+uv run python -m py_compile bot.py config.py llm/*.py handlers/*.py
+uv run python -c "import bot, config; from llm import client, prompts; from handlers import translate, chat"
+```
+
+Run the tests:
+
+```bash
+uv run python tests/test_bot.py
 ```
 
 Then in Discord:
 
-- Type Korean in the translate channel → get English back (and vice versa).
-- `@bot how are you?` in the chat channel → get an answer. A plain message
-  (no mention) is ignored.
+- `/setup mode:translate trigger:auto` in a channel → type Korean, get English
+  back (and vice versa).
+- `/setup mode:chat trigger:mention` in another channel → `@bot how are you?`
+  gets an answer; a plain message (no mention) is ignored.
+- `/setup-off` → the bot stops responding in that channel.
+- A member without **Manage Channels** running `/setup` gets a permission error.
 - The bot never replies to its own messages.
 - If OpenRouter is rate-limited or errors, the channel gets a short "try again
   later" message instead of a crash.
 
 ## Notes
 
-- Phase 1 is single-shot (no conversation history), config-file based.
-- Config access is isolated in `config.py` so Phase 2 can swap YAML → DB and
-  key by `(guild_id, channel_id)` without touching the rest of the bot.
+- Single-shot (no conversation history).
+- All config access is isolated in `config.py` (JSON store keyed by
+  `(guild_id, channel_id)`), so the storage backend can change without touching
+  the rest of the bot.
