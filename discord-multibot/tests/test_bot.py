@@ -4,6 +4,7 @@ Run: python3 -m pytest   (or: python3 tests/test_bot.py)
 Requires the project deps installed (discord.py, openai, ...).
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -17,7 +18,9 @@ from discord.app_commands import MissingPermissions
 
 import bot
 import config
+from handlers import chat as chat_handler
 from llm import client as llm_client
+from llm import tavily_search
 
 
 @dataclass
@@ -129,6 +132,234 @@ def test_429_exhaustion_raises_llmerror():
     finally:
         llm_client.time.sleep = real_sleep
         llm_client._client = None
+
+
+# --- Tool-call loop (chat web search) ----------------------------------------
+#
+# These exercise the plumbing with a MOCKED model (_create_completion) and a
+# MOCKED tool executor. No real network / MCP calls are made.
+
+class _FakeFn:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, id, name, arguments):
+        self.id = id
+        self.function = _FakeFn(name, arguments)
+
+
+class _FakeMsg:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+def _snapshot(messages):
+    return [m.copy() if isinstance(m, dict) else m for m in messages]
+
+
+_DUMMY_TOOLS = [{"type": "function", "function": {"name": "web_search"}}]
+
+
+def test_mcp_tools_to_openai_maps_schemas():
+    @dataclass
+    class _T:
+        name: str
+        description: object
+        inputSchema: object
+
+    tools = [_T("web_search", "search the web",
+                {"type": "object", "properties": {"query": {"type": "string"}}})]
+    schemas = tavily_search.mcp_tools_to_openai(tools)
+    assert len(schemas) == 1
+    fn = schemas[0]
+    assert fn["type"] == "function"
+    assert fn["function"]["name"] == "web_search"
+    assert fn["function"]["description"] == "search the web"
+    assert fn["function"]["parameters"]["properties"]["query"]["type"] == "string"
+
+    # A tool with no description / schema still yields a valid object schema.
+    fallback = tavily_search.mcp_tools_to_openai([_T("t", None, None)])
+    assert fallback[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_tool_loop_executes_and_feeds_back():
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", '{"query": "seoul weather"}')]),
+        _FakeMsg(content="서울은 맑음"),
+    ]
+    seen = []
+
+    def fake_create(model, messages, tools=None):
+        seen.append({"tools": tools, "messages": _snapshot(messages)})
+        return responses[len(seen) - 1]
+
+    executor_calls = []
+
+    async def executor(name, arguments):
+        executor_calls.append((name, arguments))
+        return "sunny 25C"
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools("m", "sys", "weather?", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    assert out == "서울은 맑음"
+    # The MCP tool was invoked with the JSON arguments parsed into a dict.
+    assert executor_calls == [("web_search", {"query": "seoul weather"})]
+    # First call offered the tool schemas to the model.
+    assert seen[0]["tools"] == _DUMMY_TOOLS
+    # Second call fed the tool result (and the assistant tool_calls) back.
+    second = seen[1]["messages"]
+    assert any(m.get("role") == "tool" and m.get("content") == "sunny 25C" for m in second)
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in second)
+
+
+def test_tool_loop_respects_iteration_cap():
+    calls = {"n": 0}
+
+    def fake_create(model, messages, tools=None):
+        calls["n"] += 1
+        if tools:  # still offering tools -> model keeps requesting one
+            return _FakeMsg(tool_calls=[_FakeToolCall("c", "web_search", "{}")])
+        return _FakeMsg(content="final answer")  # forced tool-free call
+
+    async def executor(name, arguments):
+        return "result"
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools(
+                "m", "sys", "q", _DUMMY_TOOLS, executor, max_iterations=4
+            )
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    assert out == "final answer"
+    # 4 tool-offering rounds + 1 forced tool-free call = the loop terminates.
+    assert calls["n"] == 5
+
+
+def test_tool_loop_tool_error_is_fed_back():
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", "{}")]),
+        _FakeMsg(content="best effort answer"),
+    ]
+    seen = []
+
+    def fake_create(model, messages, tools=None):
+        seen.append(_snapshot(messages))
+        return responses[len(seen) - 1]
+
+    async def executor(name, arguments):
+        raise RuntimeError("mcp down")
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools("m", "sys", "q", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    assert out == "best effort answer"
+    tool_msgs = [m for m in seen[1] if m.get("role") == "tool"]
+    assert tool_msgs and "Tool error" in tool_msgs[0]["content"]
+
+
+def test_chat_without_tavily_key_answers_without_tools():
+    prev_key = os.environ.pop("TAVILY_API_KEY", None)
+    prev_complete = llm_client.complete
+    llm_client.complete = lambda model, system, text: "답변"
+    try:
+        cfg = config.ChannelConfig("chat", "auto", True)
+        out = asyncio.run(chat_handler.handle(cfg, "hi"))
+        assert out == "답변"
+    finally:
+        llm_client.complete = prev_complete
+        if prev_key is not None:
+            os.environ["TAVILY_API_KEY"] = prev_key
+
+
+def _set_tavily_key():
+    """Set a dummy key; return the previous value for restoration."""
+    prev = os.environ.get("TAVILY_API_KEY")
+    os.environ["TAVILY_API_KEY"] = "dummy"
+    return prev
+
+
+def _restore_tavily_key(prev):
+    if prev is None:
+        os.environ.pop("TAVILY_API_KEY", None)
+    else:
+        os.environ["TAVILY_API_KEY"] = prev
+
+
+def test_chat_mcp_connection_failure_falls_back_to_no_tools():
+    prev_key = _set_tavily_key()
+    prev_session = tavily_search.session
+    prev_complete = llm_client.complete
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("connection refused")
+
+    tavily_search.session = boom
+    llm_client.complete = lambda model, system, text: "fallback"
+    try:
+        cfg = config.ChannelConfig("chat", "auto", True)
+        out = asyncio.run(chat_handler.handle(cfg, "hi"))
+        assert out == "fallback"
+    finally:
+        tavily_search.session = prev_session
+        llm_client.complete = prev_complete
+        _restore_tavily_key(prev_key)
+
+
+def test_chat_keeps_answer_despite_session_teardown_error():
+    """A good, search-backed answer must survive an MCP teardown failure."""
+    from contextlib import asynccontextmanager
+
+    prev_key = _set_tavily_key()
+    prev_session = tavily_search.session
+    prev_cwt = llm_client.complete_with_tools
+    prev_complete = llm_client.complete
+
+    @asynccontextmanager
+    async def flaky_session():
+        async def executor(name, arguments):
+            return ""
+        try:
+            yield ([], executor)
+        finally:
+            raise RuntimeError("teardown boom")
+
+    async def fake_complete_with_tools(model, system, text, tools, executor):
+        return "search-backed answer"
+
+    tavily_search.session = flaky_session
+    llm_client.complete_with_tools = fake_complete_with_tools
+    llm_client.complete = lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback used"))
+    try:
+        cfg = config.ChannelConfig("chat", "auto", True)
+        out = asyncio.run(chat_handler.handle(cfg, "hi"))
+        assert out == "search-backed answer"
+    finally:
+        tavily_search.session = prev_session
+        llm_client.complete_with_tools = prev_cwt
+        llm_client.complete = prev_complete
+        _restore_tavily_key(prev_key)
 
 
 # --- JSON config store -------------------------------------------------------
