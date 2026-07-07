@@ -23,7 +23,7 @@ discord-multibot/
 │   ├── translate.py
 │   └── chat.py
 ├── .env.example
-└── requirements.txt
+└── pyproject.toml
 ```
 
 ## 1. Create the Discord bot
@@ -72,11 +72,10 @@ Fields: `mode` (`translate`|`chat`), `model` (OpenRouter id), `trigger`
 
 ```bash
 cd discord-multibot
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+uv sync                   # creates .venv and installs dependencies
 
 cp .env.example .env      # then edit .env with your real tokens
-python bot.py
+uv run python bot.py
 ```
 
 `.env`:
