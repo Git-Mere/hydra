@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Runtime channel config written by /setup (must not be committed).
+channel_config.json
+.channel_config.*.tmp

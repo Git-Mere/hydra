@@ -1,14 +1,13 @@
 """Translate mode handler (spec section 3)."""
 
-from config import ChannelConfig
+from config import ChannelConfig, get_default_model
 from llm import client
 from llm.prompts import TRANSLATE_SYSTEM
 
 
 def handle(cfg: ChannelConfig, text: str) -> str:
-    """Translate ``text`` using the channel's model.
+    """Translate ``text`` using the default model.
 
     Raises llm.client.LLMError on failure (caller posts a guidance message).
     """
-    system_prompt = cfg.system_override or TRANSLATE_SYSTEM
-    return client.complete(cfg.model, system_prompt, text)
+    return client.complete(get_default_model(), TRANSLATE_SYSTEM, text)
