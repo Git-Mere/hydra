@@ -4,7 +4,9 @@ One Discord bot that behaves differently **per channel** — different mode and
 trigger — all routed through a single [OpenRouter](https://openrouter.ai) key.
 
 - **translate** mode: translates messages (Korean ↔ English).
-- **chat** mode: answers questions.
+- **chat** mode: answers everyday questions in Korean, with **web search** via
+  [Tavily](https://tavily.com)'s remote MCP server for current/verifiable facts
+  (weather, prices, traffic rules, news, ...).
 
 Channels are configured **at runtime** with the `/setup` slash command — no
 file editing, no restart. Config is stored in a local JSON file
@@ -19,11 +21,12 @@ discord-multibot/
 ├── config.py           # JSON config store + get/set/disable_channel_config()
 ├── channel_config.json # runtime config (gitignored, created by /setup)
 ├── llm/
-│   ├── client.py       # OpenRouter wrapper (429 backoff, timeout)
+│   ├── client.py       # OpenRouter wrapper (429 backoff, timeout, tool loop)
+│   ├── tavily_search.py# Tavily MCP client (chat web search)
 │   └── prompts.py      # TRANSLATE_SYSTEM / CHAT_SYSTEM
 ├── handlers/
-│   ├── translate.py
-│   └── chat.py
+│   ├── translate.py    # single-shot, no tools
+│   └── chat.py         # agentic web-search tool loop (Tavily MCP)
 ├── .env.example
 └── pyproject.toml
 ```
@@ -68,10 +71,28 @@ uv run python bot.py
 DISCORD_TOKEN=your_discord_bot_token
 OPENROUTER_API_KEY=sk-or-xxxxxxxx
 DEFAULT_MODEL=meta-llama/llama-3.3-70b-instruct:free   # optional, see below
+TAVILY_API_KEY=                                        # optional, see "Web search"
 ```
 
 Optional OpenRouter attribution headers: set `OPENROUTER_HTTP_REFERER` and
 `OPENROUTER_X_TITLE` in `.env` to identify your app on OpenRouter.
+
+### Web search in chat mode (`TAVILY_API_KEY`)
+
+Chat mode can search the web for current or verifiable facts (weather, prices,
+traffic rules, news, ...) using [Tavily](https://tavily.com)'s remote **MCP**
+server. Get a key at [tavily.com](https://tavily.com) and set it as
+`TAVILY_API_KEY` in `.env`.
+
+How it works: for one user turn the bot runs a bounded agentic loop (up to 4
+model↔tool round-trips). The model decides when to call the `web_search` tool,
+the bot executes it against Tavily's MCP endpoint, feeds the results back, and
+the model answers in Korean citing source URLs. There is no cross-message
+history: the loop lives entirely within a single message.
+
+**Graceful degradation:** `TAVILY_API_KEY` is optional. If it is unset (or the
+MCP connection fails at runtime), chat still answers -- it just falls back to a
+single-shot reply with no web search. Translate mode never uses tools.
 
 ### `DEFAULT_MODEL`
 
@@ -107,7 +128,7 @@ Compile / import checks (no tokens needed):
 
 ```bash
 uv run python -m py_compile bot.py config.py llm/*.py handlers/*.py
-uv run python -c "import bot, config; from llm import client, prompts; from handlers import translate, chat"
+uv run python -c "import bot, config; from llm import client, prompts, tavily_search; from handlers import translate, chat"
 ```
 
 Run the tests:
@@ -130,7 +151,8 @@ Then in Discord:
 
 ## Notes
 
-- Single-shot (no conversation history).
+- No cross-message conversation history. Chat's tool loop is per-message;
+  translate is single-shot.
 - All config access is isolated in `config.py` (JSON store keyed by
   `(guild_id, channel_id)`), so the storage backend can change without touching
   the rest of the bot.

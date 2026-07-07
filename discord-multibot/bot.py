@@ -15,6 +15,7 @@ Flow per incoming message:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -234,9 +235,14 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # 6b + 7. Dispatch and reply, splitting long output. Never crash silently.
+    # Chat is async (MCP tool loop); translate stays sync and runs in a worker
+    # thread so its blocking OpenRouter call never stalls the event loop.
     try:
         async with message.channel.typing():
-            reply = await client.loop.run_in_executor(None, handler, cfg, text)
+            if asyncio.iscoroutinefunction(handler):
+                reply = await handler(cfg, text)
+            else:
+                reply = await client.loop.run_in_executor(None, handler, cfg, text)
     except LLMError as exc:
         await message.channel.send(exc.user_message)
         return
