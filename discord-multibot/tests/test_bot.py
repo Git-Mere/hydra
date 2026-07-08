@@ -275,6 +275,44 @@ def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
         llm_client._client = None
 
 
+def test_create_completion_delivers_per_batch_reasoning_in_extra_body():
+    """Each batch's reasoning param must reach create() via extra_body, and a
+    None-reasoning batch must send NO 'reasoning' key (sending it risks a 400 on
+    models that reject it -- the OpenRouter 400-risk regression path)."""
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        plan = config.get_model_plan()
+        nemotron_batch, gpt_oss_batch, unset_batch = plan
+        # 429 the first two batches so create() is attempted for all three and
+        # the served answer comes from the reasoning=None batch.
+        fc = _BatchFakeCompletions(
+            fail_batches=[nemotron_batch["models"], gpt_oss_batch["models"]],
+            reply="ok",
+        )
+        _install_fake_client(fc)
+
+        out = llm_client._create_completion(plan, [{"role": "user", "content": "hi"}])
+        assert (out.content or "").strip() == "ok"
+
+        assert len(fc.calls) == 3
+        nemotron_call, gpt_oss_call, unset_call = fc.calls
+        # nemotron batch: reasoning disabled explicitly.
+        assert nemotron_call["extra_body"]["models"] == nemotron_batch["models"]
+        assert nemotron_call["extra_body"]["reasoning"] == {"enabled": False}
+        # gpt-oss batch: reasoning mandatory -> effort low.
+        assert gpt_oss_call["extra_body"]["models"] == gpt_oss_batch["models"]
+        assert gpt_oss_call["extra_body"]["reasoning"] == {"effort": "low"}
+        # reasoning=None batch: NO 'reasoning' key at all.
+        assert unset_call["extra_body"]["models"] == unset_batch["models"]
+        assert "reasoning" not in unset_call["extra_body"]
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+        llm_client._client = None
+
+
 # --- Tool-call loop (web searching) ------------------------------------------
 #
 # These exercise the plumbing with a MOCKED model (_create_completion) and a
