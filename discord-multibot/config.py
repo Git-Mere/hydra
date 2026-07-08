@@ -2,8 +2,8 @@
 
 Config is set at runtime via the ``/setup`` slash command and persisted to a
 local JSON file (``channel_config.json``) keyed by ``guild_id -> channel_id``.
-There is no per-channel model any more: every channel uses a single default
-model (``DEFAULT_MODEL`` / the ``DEFAULT_MODEL`` env var).
+There is no per-channel model any more: every channel uses a single model
+fallback chain (``MODEL_CHAIN`` / ``DEFAULT_MODEL`` env vars).
 
 All config access goes through this module. The store is loaded into memory at
 startup and written back atomically (temp file + ``os.replace``) on every
@@ -23,20 +23,43 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "channel_config.json")
 
-# Single model used for every channel. Overridable via the DEFAULT_MODEL env
-# var; the constant below is the fallback when it is unset. OpenRouter's free
-# tier changes over time, so swap this via DEFAULT_MODEL if the model 400s
-# (e.g. an alternative like "qwen/qwen3-next-80b-a3b-instruct:free").
-DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+# Ordered default model fallback chain used for every channel. OpenRouter
+# accepts at most three server-side fallback models per request, so the client
+# batches this chain when calling chat/completions.
+DEFAULT_MODEL_CHAIN = [
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "google/gemma-4-31b-it:free",
+]
+
+# Backward-compatible module-level fallback constant.
+DEFAULT_MODEL = DEFAULT_MODEL_CHAIN[0]
 
 # Allowed values, shared with the slash command choices.
 MODES = ("translate", "chat")
 TRIGGERS = ("auto", "mention")
 
 
+def get_model_chain() -> list[str]:
+    """Return the ordered model chain used for all channels."""
+    env_chain = os.environ.get("MODEL_CHAIN")
+    if env_chain is not None:
+        chain = [model.strip() for model in env_chain.split(",") if model.strip()]
+        return chain or list(DEFAULT_MODEL_CHAIN)
+
+    env_default = os.environ.get("DEFAULT_MODEL")
+    if env_default:
+        return [env_default] + [model for model in DEFAULT_MODEL_CHAIN if model != env_default]
+
+    return list(DEFAULT_MODEL_CHAIN)
+
+
 def get_default_model() -> str:
-    """Return the model id used for all channels (env DEFAULT_MODEL or fallback)."""
-    return os.environ.get("DEFAULT_MODEL") or DEFAULT_MODEL
+    """Return the primary model id used for all channels."""
+    return get_model_chain()[0]
 
 
 @dataclass(frozen=True)
