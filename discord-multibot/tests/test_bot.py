@@ -285,11 +285,11 @@ def test_create_completion_delivers_per_batch_reasoning_in_extra_body():
         os.environ.pop("DEFAULT_MODEL", None)
         os.environ.pop("MODEL_CHAIN", None)
         plan = config.get_model_plan()
-        nemotron_batch, gpt_oss_batch, unset_batch = plan
+        gpt_oss_batch, unset_batch, nemotron_batch = plan
         # 429 the first two batches so create() is attempted for all three and
-        # the served answer comes from the reasoning=None batch.
+        # the served answer comes from the nemotron availability-net batch.
         fc = _BatchFakeCompletions(
-            fail_batches=[nemotron_batch["models"], gpt_oss_batch["models"]],
+            fail_batches=[gpt_oss_batch["models"], unset_batch["models"]],
             reply="ok",
         )
         _install_fake_client(fc)
@@ -298,16 +298,16 @@ def test_create_completion_delivers_per_batch_reasoning_in_extra_body():
         assert (out.content or "").strip() == "ok"
 
         assert len(fc.calls) == 3
-        nemotron_call, gpt_oss_call, unset_call = fc.calls
-        # nemotron batch: reasoning disabled explicitly.
-        assert nemotron_call["extra_body"]["models"] == nemotron_batch["models"]
-        assert nemotron_call["extra_body"]["reasoning"] == {"enabled": False}
+        gpt_oss_call, unset_call, nemotron_call = fc.calls
         # gpt-oss batch: reasoning mandatory -> effort low.
         assert gpt_oss_call["extra_body"]["models"] == gpt_oss_batch["models"]
         assert gpt_oss_call["extra_body"]["reasoning"] == {"effort": "low"}
         # reasoning=None batch: NO 'reasoning' key at all.
         assert unset_call["extra_body"]["models"] == unset_batch["models"]
         assert "reasoning" not in unset_call["extra_body"]
+        # nemotron batch: reasoning disabled explicitly.
+        assert nemotron_call["extra_body"]["models"] == nemotron_batch["models"]
+        assert nemotron_call["extra_body"]["reasoning"] == {"enabled": False}
     finally:
         _restore_model_env(prev_default, prev_chain)
         llm_client._client = None
@@ -716,13 +716,6 @@ def test_model_plan_default_batches_by_reasoning():
         plan = config.get_model_plan()
         assert plan == [
             {
-                "models": [
-                    "nvidia/nemotron-3-nano-30b-a3b:free",
-                    "nvidia/nemotron-3-super-120b-a12b:free",
-                ],
-                "reasoning": {"enabled": False},
-            },
-            {
                 "models": ["openai/gpt-oss-20b:free"],
                 "reasoning": {"effort": "low"},
             },
@@ -733,6 +726,13 @@ def test_model_plan_default_batches_by_reasoning():
                     "google/gemma-4-31b-it:free",
                 ],
                 "reasoning": None,
+            },
+            {
+                "models": [
+                    "nvidia/nemotron-3-super-120b-a12b:free",
+                    "nvidia/nemotron-3-nano-30b-a3b:free",
+                ],
+                "reasoning": {"enabled": False},
             },
         ]
     finally:

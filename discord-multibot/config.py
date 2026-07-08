@@ -23,19 +23,19 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "channel_config.json")
 
-# Ordered, speed-first default model fallback chain used for every channel.
-# Fast, reliable models lead; reasoning is turned off/low per model (see
-# MODEL_REASONING) so trivial translate/web-search turns don't waste seconds on
-# hidden chain-of-thought. OpenRouter accepts at most three server-side fallback
-# models per request, so the client batches this chain when calling
-# chat/completions.
+# Ordered, quality-first default model fallback chain used for every channel.
+# gpt-oss leads as the reliable/correct primary; qwen, llama, and gemma provide
+# quality fallbacks; nemotron models are kept last as an availability net.
+# Reasoning is turned off/low per model (see MODEL_REASONING). OpenRouter
+# accepts at most three server-side fallback models per request, so the client
+# batches this chain when calling chat/completions.
 DEFAULT_MODEL_CHAIN = [
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
     "openai/gpt-oss-20b:free",
     "qwen/qwen3-next-80b-a3b-instruct:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
 ]
 
 # Per-model reasoning body param (OpenRouter `reasoning` field). Verified facts:
