@@ -6,6 +6,7 @@ Requires the project deps installed (discord.py, openai, ...).
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -64,16 +65,25 @@ class _FakeCompletions:
     """Stand-in for client.chat.completions that raises 429 a fixed number
     of times, then returns a canned reply."""
 
-    def __init__(self, fail_times, reply="ok"):
+    def __init__(self, fail_times, reply="ok", served_model="served-model"):
         self.fail_times = fail_times
         self.reply = reply
+        self.served_model = served_model
         self.calls = 0
+        self.kwargs = []
 
-    def create(self, **kwargs):
+    def create(self, *, model, messages, tools=None, extra_body=None):
         import httpx
         from openai import RateLimitError
 
         self.calls += 1
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "extra_body": extra_body,
+        }
+        self.kwargs.append(kwargs)
         if self.calls <= self.fail_times:
             resp = httpx.Response(429, request=httpx.Request("POST", "http://x"))
             raise RateLimitError("rate limited", response=resp, body=None)
@@ -87,7 +97,54 @@ class _FakeCompletions:
         class _Resp:
             choices = [_Choice()]
 
-        return _Resp()
+        response = _Resp()
+        response.model = self.served_model
+        return response
+
+
+def _rate_limit_error(headers=None, body=None):
+    import httpx
+    from openai import RateLimitError
+
+    resp = httpx.Response(
+        429,
+        headers=headers or {},
+        request=httpx.Request("POST", "http://x"),
+    )
+    return RateLimitError("rate limited", response=resp, body=body)
+
+
+class _BatchFakeCompletions:
+    def __init__(self, fail_batches, reply="ok", served_model="served-model"):
+        self.fail_batches = [tuple(batch) for batch in fail_batches]
+        self.reply = reply
+        self.served_model = served_model
+        self.calls = []
+
+    def create(self, *, model, messages, tools=None, extra_body=None):
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "extra_body": extra_body,
+        }
+        self.calls.append(kwargs)
+        batch = tuple(extra_body["models"])
+        if batch in self.fail_batches:
+            raise _rate_limit_error()
+
+        class _Msg:
+            content = self.reply
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        response = _Resp()
+        response.model = self.served_model
+        return response
 
 
 class _FakeClient:
@@ -106,7 +163,7 @@ def test_429_retry_then_success():
     try:
         fc = _FakeCompletions(fail_times=2, reply="translated")
         _install_fake_client(fc)
-        out = llm_client.complete("m", "sys", "hi")
+        out = llm_client.complete(["m"], "sys", "hi")
         assert out == "translated"
         assert fc.calls == 3          # 2 failures + 1 success
         assert len(slept) == 2        # slept before each retry
@@ -124,11 +181,88 @@ def test_429_exhaustion_raises_llmerror():
         _install_fake_client(fc)
         raised = False
         try:
-            llm_client.complete("m", "sys", "hi")
+            llm_client.complete(["m"], "sys", "hi")
         except llm_client.LLMError:
             raised = True
         assert raised
         assert fc.calls == llm_client.MAX_RETRIES  # gave up after MAX_RETRIES
+    finally:
+        llm_client.time.sleep = real_sleep
+        llm_client._client = None
+
+
+def test_429_batch_falls_through_to_next_batch():
+    first_batch = ["m1", "m2", "m3"]
+    second_batch = ["m4", "m5", "m6"]
+    fc = _BatchFakeCompletions(fail_batches=[first_batch], reply="from fallback")
+    _install_fake_client(fc)
+    try:
+        out = llm_client.complete(first_batch + second_batch, "sys", "hi")
+        assert out == "from fallback"
+        assert len(fc.calls) == 2
+        assert fc.calls[0]["model"] == "m1"
+        assert fc.calls[0]["extra_body"]["models"] == first_batch
+        assert "models" not in fc.calls[0]
+        assert fc.calls[1]["model"] == "m4"
+        assert fc.calls[1]["extra_body"]["models"] == second_batch
+        assert "models" not in fc.calls[1]
+    finally:
+        llm_client._client = None
+
+
+def test_served_model_is_logged():
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    llm_client.logger.addHandler(handler)
+    previous_level = llm_client.logger.level
+    llm_client.logger.setLevel(logging.INFO)
+    fc = _FakeCompletions(fail_times=0, reply="ok", served_model="actual/model:free")
+    _install_fake_client(fc)
+    try:
+        assert llm_client.complete(["requested/model:free"], "sys", "hi") == "ok"
+        assert any("actual/model:free" in record.getMessage() for record in records)
+    finally:
+        llm_client.logger.removeHandler(handler)
+        llm_client.logger.setLevel(previous_level)
+        llm_client._client = None
+
+
+def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
+    class _AlwaysRateLimited:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, *, model, messages, tools=None, extra_body=None):
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "extra_body": extra_body,
+            }
+            self.calls.append(kwargs)
+            raise _rate_limit_error(headers={"Retry-After": "60"})
+
+    slept = []
+    real_sleep = llm_client.time.sleep
+    llm_client.time.sleep = lambda s: slept.append(s)
+    fc = _AlwaysRateLimited()
+    _install_fake_client(fc)
+    try:
+        raised = False
+        try:
+            llm_client.complete(["m1", "m2", "m3", "m4", "m5", "m6"], "sys", "hi")
+        except llm_client.LLMError:
+            raised = True
+        assert raised
+        assert len(fc.calls) == 2 * llm_client.MAX_RETRIES
+        assert fc.calls[0]["extra_body"]["models"] == ["m1", "m2", "m3"]
+        assert "models" not in fc.calls[0]
+        assert slept == [8.0, 8.0]
     finally:
         llm_client.time.sleep = real_sleep
         llm_client._client = None
@@ -193,7 +327,7 @@ def test_tool_loop_executes_and_feeds_back():
     ]
     seen = []
 
-    def fake_create(model, messages, tools=None):
+    def fake_create(models, messages, tools=None):
         seen.append({"tools": tools, "messages": _snapshot(messages)})
         return responses[len(seen) - 1]
 
@@ -207,7 +341,7 @@ def test_tool_loop_executes_and_feeds_back():
     llm_client._create_completion = fake_create
     try:
         out = asyncio.run(
-            llm_client.complete_with_tools("m", "sys", "weather?", _DUMMY_TOOLS, executor)
+            llm_client.complete_with_tools(["m"], "sys", "weather?", _DUMMY_TOOLS, executor)
         )
     finally:
         llm_client._create_completion = prev
@@ -226,7 +360,7 @@ def test_tool_loop_executes_and_feeds_back():
 def test_tool_loop_respects_iteration_cap():
     calls = {"n": 0}
 
-    def fake_create(model, messages, tools=None):
+    def fake_create(models, messages, tools=None):
         calls["n"] += 1
         if tools:  # still offering tools -> model keeps requesting one
             return _FakeMsg(tool_calls=[_FakeToolCall("c", "web_search", "{}")])
@@ -240,7 +374,7 @@ def test_tool_loop_respects_iteration_cap():
     try:
         out = asyncio.run(
             llm_client.complete_with_tools(
-                "m", "sys", "q", _DUMMY_TOOLS, executor, max_iterations=4
+                ["m"], "sys", "q", _DUMMY_TOOLS, executor, max_iterations=4
             )
         )
     finally:
@@ -258,7 +392,7 @@ def test_tool_loop_tool_error_is_fed_back():
     ]
     seen = []
 
-    def fake_create(model, messages, tools=None):
+    def fake_create(models, messages, tools=None):
         seen.append(_snapshot(messages))
         return responses[len(seen) - 1]
 
@@ -269,7 +403,7 @@ def test_tool_loop_tool_error_is_fed_back():
     llm_client._create_completion = fake_create
     try:
         out = asyncio.run(
-            llm_client.complete_with_tools("m", "sys", "q", _DUMMY_TOOLS, executor)
+            llm_client.complete_with_tools(["m"], "sys", "q", _DUMMY_TOOLS, executor)
         )
     finally:
         llm_client._create_completion = prev
@@ -456,18 +590,55 @@ def test_module_wrappers_use_singleton_store():
         config._store = prev
 
 
-def test_default_model_env_override():
-    prev = os.environ.get("DEFAULT_MODEL")
+def _restore_model_env(prev_default, prev_chain):
+    if prev_default is None:
+        os.environ.pop("DEFAULT_MODEL", None)
+    else:
+        os.environ["DEFAULT_MODEL"] = prev_default
+    if prev_chain is None:
+        os.environ.pop("MODEL_CHAIN", None)
+    else:
+        os.environ["MODEL_CHAIN"] = prev_chain
+
+
+def test_model_chain_default():
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
     try:
         os.environ.pop("DEFAULT_MODEL", None)
-        assert config.get_default_model() == config.DEFAULT_MODEL
-        os.environ["DEFAULT_MODEL"] = "vendor/custom-model"
-        assert config.get_default_model() == "vendor/custom-model"
+        os.environ.pop("MODEL_CHAIN", None)
+        assert config.get_model_chain() == config.DEFAULT_MODEL_CHAIN
+        assert config.get_default_model() == config.get_model_chain()[0]
     finally:
-        if prev is None:
-            os.environ.pop("DEFAULT_MODEL", None)
-        else:
-            os.environ["DEFAULT_MODEL"] = prev
+        _restore_model_env(prev_default, prev_chain)
+
+
+def test_model_chain_model_chain_env_override():
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ["DEFAULT_MODEL"] = "ignored/default"
+        os.environ["MODEL_CHAIN"] = " vendor/a , ,vendor/b, vendor/c "
+        assert config.get_model_chain() == ["vendor/a", "vendor/b", "vendor/c"]
+        assert config.get_default_model() == "vendor/a"
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+
+
+def test_model_chain_default_model_primary_with_fallbacks_deduped():
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("MODEL_CHAIN", None)
+        chosen = config.DEFAULT_MODEL_CHAIN[3]
+        os.environ["DEFAULT_MODEL"] = chosen
+        chain = config.get_model_chain()
+        assert chain[0] == chosen
+        assert chain.count(chosen) == 1
+        assert chain[1:] == [model for model in config.DEFAULT_MODEL_CHAIN if model != chosen]
+        assert config.get_default_model() == chain[0]
+    finally:
+        _restore_model_env(prev_default, prev_chain)
 
 
 # --- Slash commands / app_commands tree --------------------------------------
