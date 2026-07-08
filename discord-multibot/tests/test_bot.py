@@ -19,7 +19,7 @@ from discord.app_commands import MissingPermissions
 
 import bot
 import config
-from handlers import chat as chat_handler
+from handlers import websearch as websearch_handler
 from llm import client as llm_client
 from llm import tavily_search
 
@@ -156,6 +156,11 @@ def _install_fake_client(monkey_completions):
     llm_client._client = _FakeClient(monkey_completions)
 
 
+def _plan(*batches, reasoning=None):
+    """Build a model plan from one or more model-id lists (test helper)."""
+    return [{"models": list(batch), "reasoning": reasoning} for batch in batches]
+
+
 def test_429_retry_then_success():
     slept = []
     real_sleep = llm_client.time.sleep
@@ -163,7 +168,7 @@ def test_429_retry_then_success():
     try:
         fc = _FakeCompletions(fail_times=2, reply="translated")
         _install_fake_client(fc)
-        out = llm_client.complete(["m"], "sys", "hi")
+        out = llm_client.complete(_plan(["m"]), "sys", "hi")
         assert out == "translated"
         assert fc.calls == 3          # 2 failures + 1 success
         assert len(slept) == 2        # slept before each retry
@@ -181,7 +186,7 @@ def test_429_exhaustion_raises_llmerror():
         _install_fake_client(fc)
         raised = False
         try:
-            llm_client.complete(["m"], "sys", "hi")
+            llm_client.complete(_plan(["m"]), "sys", "hi")
         except llm_client.LLMError:
             raised = True
         assert raised
@@ -197,7 +202,7 @@ def test_429_batch_falls_through_to_next_batch():
     fc = _BatchFakeCompletions(fail_batches=[first_batch], reply="from fallback")
     _install_fake_client(fc)
     try:
-        out = llm_client.complete(first_batch + second_batch, "sys", "hi")
+        out = llm_client.complete(_plan(first_batch, second_batch), "sys", "hi")
         assert out == "from fallback"
         assert len(fc.calls) == 2
         assert fc.calls[0]["model"] == "m1"
@@ -224,7 +229,7 @@ def test_served_model_is_logged():
     fc = _FakeCompletions(fail_times=0, reply="ok", served_model="actual/model:free")
     _install_fake_client(fc)
     try:
-        assert llm_client.complete(["requested/model:free"], "sys", "hi") == "ok"
+        assert llm_client.complete(_plan(["requested/model:free"]), "sys", "hi") == "ok"
         assert any("actual/model:free" in record.getMessage() for record in records)
     finally:
         llm_client.logger.removeHandler(handler)
@@ -255,7 +260,9 @@ def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
     try:
         raised = False
         try:
-            llm_client.complete(["m1", "m2", "m3", "m4", "m5", "m6"], "sys", "hi")
+            llm_client.complete(
+                _plan(["m1", "m2", "m3"], ["m4", "m5", "m6"]), "sys", "hi"
+            )
         except llm_client.LLMError:
             raised = True
         assert raised
@@ -268,7 +275,45 @@ def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
         llm_client._client = None
 
 
-# --- Tool-call loop (chat web search) ----------------------------------------
+def test_create_completion_delivers_per_batch_reasoning_in_extra_body():
+    """Each batch's reasoning param must reach create() via extra_body, and a
+    None-reasoning batch must send NO 'reasoning' key (sending it risks a 400 on
+    models that reject it -- the OpenRouter 400-risk regression path)."""
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        plan = config.get_model_plan()
+        nemotron_batch, gpt_oss_batch, unset_batch = plan
+        # 429 the first two batches so create() is attempted for all three and
+        # the served answer comes from the reasoning=None batch.
+        fc = _BatchFakeCompletions(
+            fail_batches=[nemotron_batch["models"], gpt_oss_batch["models"]],
+            reply="ok",
+        )
+        _install_fake_client(fc)
+
+        out = llm_client._create_completion(plan, [{"role": "user", "content": "hi"}])
+        assert (out.content or "").strip() == "ok"
+
+        assert len(fc.calls) == 3
+        nemotron_call, gpt_oss_call, unset_call = fc.calls
+        # nemotron batch: reasoning disabled explicitly.
+        assert nemotron_call["extra_body"]["models"] == nemotron_batch["models"]
+        assert nemotron_call["extra_body"]["reasoning"] == {"enabled": False}
+        # gpt-oss batch: reasoning mandatory -> effort low.
+        assert gpt_oss_call["extra_body"]["models"] == gpt_oss_batch["models"]
+        assert gpt_oss_call["extra_body"]["reasoning"] == {"effort": "low"}
+        # reasoning=None batch: NO 'reasoning' key at all.
+        assert unset_call["extra_body"]["models"] == unset_batch["models"]
+        assert "reasoning" not in unset_call["extra_body"]
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+        llm_client._client = None
+
+
+# --- Tool-call loop (web searching) ------------------------------------------
 #
 # These exercise the plumbing with a MOCKED model (_create_completion) and a
 # MOCKED tool executor. No real network / MCP calls are made.
@@ -341,7 +386,7 @@ def test_tool_loop_executes_and_feeds_back():
     llm_client._create_completion = fake_create
     try:
         out = asyncio.run(
-            llm_client.complete_with_tools(["m"], "sys", "weather?", _DUMMY_TOOLS, executor)
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "weather?", _DUMMY_TOOLS, executor)
         )
     finally:
         llm_client._create_completion = prev
@@ -374,7 +419,7 @@ def test_tool_loop_respects_iteration_cap():
     try:
         out = asyncio.run(
             llm_client.complete_with_tools(
-                ["m"], "sys", "q", _DUMMY_TOOLS, executor, max_iterations=4
+                _plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor, max_iterations=4
             )
         )
     finally:
@@ -403,7 +448,7 @@ def test_tool_loop_tool_error_is_fed_back():
     llm_client._create_completion = fake_create
     try:
         out = asyncio.run(
-            llm_client.complete_with_tools(["m"], "sys", "q", _DUMMY_TOOLS, executor)
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
         )
     finally:
         llm_client._create_completion = prev
@@ -413,14 +458,17 @@ def test_tool_loop_tool_error_is_fed_back():
     assert tool_msgs and "Tool error" in tool_msgs[0]["content"]
 
 
-def test_chat_without_tavily_key_answers_without_tools():
+def test_websearch_without_tavily_key_returns_unavailable():
     prev_key = os.environ.pop("TAVILY_API_KEY", None)
     prev_complete = llm_client.complete
-    llm_client.complete = lambda model, system, text: "답변"
+    # complete() must NOT be called: no memory-based answer when search is down.
+    llm_client.complete = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("memory fallback used")
+    )
     try:
-        cfg = config.ChannelConfig("chat", "auto", True)
-        out = asyncio.run(chat_handler.handle(cfg, "hi"))
-        assert out == "답변"
+        cfg = config.ChannelConfig("websearch", "auto", True)
+        out = asyncio.run(websearch_handler.handle(cfg, "hi"))
+        assert out == websearch_handler.WEBSEARCH_UNAVAILABLE_MESSAGE
     finally:
         llm_client.complete = prev_complete
         if prev_key is not None:
@@ -441,7 +489,7 @@ def _restore_tavily_key(prev):
         os.environ["TAVILY_API_KEY"] = prev
 
 
-def test_chat_mcp_connection_failure_falls_back_to_no_tools():
+def test_websearch_mcp_connection_failure_returns_unavailable():
     prev_key = _set_tavily_key()
     prev_session = tavily_search.session
     prev_complete = llm_client.complete
@@ -450,18 +498,21 @@ def test_chat_mcp_connection_failure_falls_back_to_no_tools():
         raise RuntimeError("connection refused")
 
     tavily_search.session = boom
-    llm_client.complete = lambda model, system, text: "fallback"
+    # complete() must NOT be called: no memory-based answer when search is down.
+    llm_client.complete = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("memory fallback used")
+    )
     try:
-        cfg = config.ChannelConfig("chat", "auto", True)
-        out = asyncio.run(chat_handler.handle(cfg, "hi"))
-        assert out == "fallback"
+        cfg = config.ChannelConfig("websearch", "auto", True)
+        out = asyncio.run(websearch_handler.handle(cfg, "hi"))
+        assert out == websearch_handler.WEBSEARCH_UNAVAILABLE_MESSAGE
     finally:
         tavily_search.session = prev_session
         llm_client.complete = prev_complete
         _restore_tavily_key(prev_key)
 
 
-def test_chat_keeps_answer_despite_session_teardown_error():
+def test_websearch_keeps_answer_despite_session_teardown_error():
     """A good, search-backed answer must survive an MCP teardown failure."""
     from contextlib import asynccontextmanager
 
@@ -479,15 +530,15 @@ def test_chat_keeps_answer_despite_session_teardown_error():
         finally:
             raise RuntimeError("teardown boom")
 
-    async def fake_complete_with_tools(model, system, text, tools, executor):
+    async def fake_complete_with_tools(plan, system, text, tools, executor):
         return "search-backed answer"
 
     tavily_search.session = flaky_session
     llm_client.complete_with_tools = fake_complete_with_tools
     llm_client.complete = lambda *a, **k: (_ for _ in ()).throw(AssertionError("fallback used"))
     try:
-        cfg = config.ChannelConfig("chat", "auto", True)
-        out = asyncio.run(chat_handler.handle(cfg, "hi"))
+        cfg = config.ChannelConfig("websearch", "auto", True)
+        out = asyncio.run(websearch_handler.handle(cfg, "hi"))
         assert out == "search-backed answer"
     finally:
         tavily_search.session = prev_session
@@ -508,14 +559,14 @@ def test_store_set_get_and_persist():
     store = config.JsonStore(path)
     assert store.get(1, 2) is None                       # unregistered -> None
 
-    cfg = store.set(1, 2, "chat", "mention")
-    assert cfg == config.ChannelConfig("chat", "mention", True)
+    cfg = store.set(1, 2, "websearch", "mention")
+    assert cfg == config.ChannelConfig("websearch", "mention", True)
     assert store.get(1, 2) == cfg
     assert store.get("1", "2") == cfg                     # int/str keys equivalent
 
     # Reloading from disk yields the same config (persistence works).
     reloaded = config.JsonStore(path)
-    assert reloaded.get(1, 2) == config.ChannelConfig("chat", "mention", True)
+    assert reloaded.get(1, 2) == config.ChannelConfig("websearch", "mention", True)
 
 
 def test_store_guild_and_channel_keying():
@@ -528,7 +579,7 @@ def test_store_guild_and_channel_keying():
 
 def test_store_set_replaces_existing():
     store = config.JsonStore(_tmp_store_path())
-    store.set(1, 2, "chat", "mention")
+    store.set(1, 2, "websearch", "mention")
     store.set(1, 2, "translate", "auto")
     assert store.get(1, 2) == config.ChannelConfig("translate", "auto", True)
 
@@ -536,7 +587,7 @@ def test_store_set_replaces_existing():
 def test_store_disable():
     path = _tmp_store_path()
     store = config.JsonStore(path)
-    store.set(1, 2, "chat", "auto")
+    store.set(1, 2, "websearch", "auto")
 
     assert store.disable(1, 2) is True
     assert store.get(1, 2).enabled is False
@@ -549,14 +600,14 @@ def test_store_disable():
 def test_store_atomic_write_leaves_no_temp_file():
     path = _tmp_store_path()
     store = config.JsonStore(path)
-    store.set(1, 2, "chat", "auto")
+    store.set(1, 2, "websearch", "auto")
 
     directory = os.path.dirname(path)
     leftovers = [n for n in os.listdir(directory) if n.startswith(".channel_config.")]
     assert leftovers == []
     with open(path, encoding="utf-8") as f:
         on_disk = json.load(f)
-    assert on_disk == {"1": {"2": {"mode": "chat", "trigger": "auto", "enabled": True}}}
+    assert on_disk == {"1": {"2": {"mode": "websearch", "trigger": "auto", "enabled": True}}}
 
 
 def test_store_missing_file_starts_empty():
@@ -571,8 +622,23 @@ def test_store_corrupt_file_starts_empty():
     store = config.JsonStore(path)          # must not raise
     assert store.get(1, 2) is None
     # store is usable afterwards (overwrites the corrupt file)
-    store.set(1, 2, "chat", "auto")
+    store.set(1, 2, "websearch", "auto")
     assert config.JsonStore(path).get(1, 2) is not None
+
+
+def test_store_migrates_legacy_chat_mode_to_websearch():
+    """A persisted 'chat' mode (pre-rename) loads as 'websearch'."""
+    path = _tmp_store_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"1": {"2": {"mode": "chat", "trigger": "mention", "enabled": True}}}, f
+        )
+    store = config.JsonStore(path)
+    cfg = store.get(1, 2)
+    assert cfg is not None
+    assert cfg.mode == "websearch"       # legacy "chat" migrated on load
+    assert cfg.trigger == "mention"      # other fields preserved
+    assert cfg.enabled is True
 
 
 def test_module_wrappers_use_singleton_store():
@@ -641,6 +707,54 @@ def test_model_chain_default_model_primary_with_fallbacks_deduped():
         _restore_model_env(prev_default, prev_chain)
 
 
+def test_model_plan_default_batches_by_reasoning():
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        plan = config.get_model_plan()
+        assert plan == [
+            {
+                "models": [
+                    "nvidia/nemotron-3-nano-30b-a3b:free",
+                    "nvidia/nemotron-3-super-120b-a12b:free",
+                ],
+                "reasoning": {"enabled": False},
+            },
+            {
+                "models": ["openai/gpt-oss-20b:free"],
+                "reasoning": {"effort": "low"},
+            },
+            {
+                "models": [
+                    "qwen/qwen3-next-80b-a3b-instruct:free",
+                    "meta-llama/llama-3.3-70b-instruct:free",
+                    "google/gemma-4-31b-it:free",
+                ],
+                "reasoning": None,
+            },
+        ]
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+
+
+def test_model_plan_unknown_ids_map_to_no_reasoning_and_slice_by_three():
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ["MODEL_CHAIN"] = "a,b,c,d"
+        plan = config.get_model_plan()
+        # Unknown ids -> reasoning None, grouped and sliced to <=3 per batch.
+        assert plan == [
+            {"models": ["a", "b", "c"], "reasoning": None},
+            {"models": ["d"], "reasoning": None},
+        ]
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+
+
 # --- Slash commands / app_commands tree --------------------------------------
 
 def test_command_tree_builds():
@@ -652,7 +766,7 @@ def test_command_tree_builds():
     assert {"mode", "trigger"} <= param_names
     # Pickers: choices are exposed to Discord.
     mode_param = next(p for p in setup.parameters if p.name == "mode")
-    assert {c.value for c in mode_param.choices} == {"translate", "chat"}
+    assert {c.value for c in mode_param.choices} == {"translate", "websearch"}
 
 
 class _FakeInteraction:

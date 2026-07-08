@@ -5,10 +5,14 @@ OpenRouter server-side model fallback, bounded client-side batch retries, a
 request timeout, and optional identifying headers.
 
 Public surface:
-    complete(models, system_prompt, user_message) -> str
-    complete_with_tools(models, system_prompt, user_message, tools, tool_executor)
-        -> str  (async; runs a bounded tool-call loop for chat mode)
+    complete(plan, system_prompt, user_message) -> str
+    complete_with_tools(plan, system_prompt, user_message, tools, tool_executor)
+        -> str  (async; runs a bounded tool-call loop for web searching mode)
     LLMError  -- raised on unrecoverable failure; carries a user-facing message.
+
+``plan`` is the batched model plan from config.get_model_plan(): an ordered
+list of ``{"models": [...], "reasoning": {..}|None}`` batches, each already
+sliced to OpenRouter's fallback cap and reasoning-consistent.
 """
 
 from __future__ import annotations
@@ -29,8 +33,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT = 30.0        # seconds
 MAX_RETRIES = 3               # full-chain passes on 429 before giving up
 BACKOFF_BASE = 2.0           # seconds; sleep = BACKOFF_BASE * 2**attempt
-MAX_TOOL_ITERATIONS = 4       # cap on model<->tool round-trips in chat mode
-MAX_OPENROUTER_FALLBACK_MODELS = 3
+MAX_TOOL_ITERATIONS = 4       # cap on model<->tool round-trips in web searching mode
 MAX_BACKOFF_SECONDS = 8.0
 
 # Short, user-facing guidance. Handlers/bot post this on failure.
@@ -78,17 +81,6 @@ def _get_client() -> OpenAI:
     return _client
 
 
-def _model_batches(models: list[str]) -> list[list[str]]:
-    """Split a model chain into OpenRouter-compatible fallback batches."""
-    chain = [model for model in models if model]
-    if not chain:
-        raise LLMError()
-    return [
-        chain[i : i + MAX_OPENROUTER_FALLBACK_MODELS]
-        for i in range(0, len(chain), MAX_OPENROUTER_FALLBACK_MODELS)
-    ]
-
-
 def _retry_after_seconds(exc: RateLimitError, attempt: int) -> float:
     """Return bounded 429 backoff, preferring server Retry-After hints."""
     response = getattr(exc, "response", None)
@@ -118,26 +110,33 @@ def _retry_after_seconds(exc: RateLimitError, attempt: int) -> float:
     return min(BACKOFF_BASE * (2 ** attempt), MAX_BACKOFF_SECONDS)
 
 
-def _create_completion(models: list[str], messages: list[dict], tools: Optional[list] = None):
+def _create_completion(plan: list[dict], messages: list[dict], tools: Optional[list] = None):
     """Make one chat-completion call and return the assistant message object.
 
-    Tries OpenRouter's server-side fallback in batches of at most three models.
-    If every batch 429s, retries the full chain with bounded backoff up to
-    MAX_RETRIES passes. Raises LLMError on rate-limit exhaustion, timeout, or
-    any API error. This is the single place the 429/timeout policy lives; both
-    complete() and the tool loop use it.
+    Walks the batched model ``plan`` (each batch already sliced to OpenRouter's
+    fallback cap), using OpenRouter's server-side fallback within each batch and
+    applying the batch's shared reasoning param. If every batch 429s, retries
+    the full plan with bounded backoff up to MAX_RETRIES passes. Raises LLMError
+    on rate-limit exhaustion, timeout, or any API error. This is the single
+    place the 429/timeout policy lives; both complete() and the tool loop use it.
     """
     client = _get_client()
-    batches = _model_batches(models)
+    if not plan:
+        raise LLMError()
     last_exc: Optional[Exception] = None
 
     for attempt in range(MAX_RETRIES):
-        for batch in batches:
+        for batch in plan:
+            models = batch["models"]
+            reasoning = batch.get("reasoning")
             try:
+                extra_body = {"models": models}
+                if reasoning:
+                    extra_body["reasoning"] = reasoning
                 kwargs = {
-                    "model": batch[0],
+                    "model": models[0],
                     "messages": messages,
-                    "extra_body": {"models": batch},
+                    "extra_body": extra_body,
                 }
                 if tools:
                     kwargs["tools"] = tools
@@ -147,7 +146,7 @@ def _create_completion(models: list[str], messages: list[dict], tools: Optional[
 
             except RateLimitError as exc:
                 last_exc = exc
-                logger.warning("429 from OpenRouter for model batch %s", batch)
+                logger.warning("429 from OpenRouter for model batch %s", models)
                 continue
 
             except APITimeoutError as exc:
@@ -173,13 +172,13 @@ def _create_completion(models: list[str], messages: list[dict], tools: Optional[
     raise LLMError() from last_exc
 
 
-def complete(models: list[str], system_prompt: str, user_message: str) -> str:
+def complete(plan: list[dict], system_prompt: str, user_message: str) -> str:
     """Call the model and return the reply text (single-shot, no tools).
 
-    Used by translate mode and as the search-free fallback for chat.
+    Used by translate mode.
     """
     message = _create_completion(
-        models,
+        plan,
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -187,7 +186,7 @@ def complete(models: list[str], system_prompt: str, user_message: str) -> str:
     )
     text = (message.content or "").strip()
     if not text:
-        logger.warning("Empty completion from model chain %s", models)
+        logger.warning("Empty completion from model plan %s", plan)
         raise LLMError()
     return text
 
@@ -209,7 +208,7 @@ def _assistant_message_dict(message) -> dict:
 
 
 async def complete_with_tools(
-    models: list[str],
+    plan: list[dict],
     system_prompt: str,
     user_message: str,
     tools: list,
@@ -236,11 +235,11 @@ async def complete_with_tools(
     ]
 
     for _ in range(max_iterations):
-        message = await asyncio.to_thread(_create_completion, models, messages, tools)
+        message = await asyncio.to_thread(_create_completion, plan, messages, tools)
         if not getattr(message, "tool_calls", None):
             text = (message.content or "").strip()
             if not text:
-                logger.warning("Empty completion from model chain %s", models)
+                logger.warning("Empty completion from model plan %s", plan)
                 raise LLMError()
             return text
 
@@ -261,9 +260,9 @@ async def complete_with_tools(
 
     # Cap reached: force a final answer with no further tool calls.
     logger.info("Tool loop hit the %d-iteration cap; forcing a final answer", max_iterations)
-    message = await asyncio.to_thread(_create_completion, models, messages, None)
+    message = await asyncio.to_thread(_create_completion, plan, messages, None)
     text = (message.content or "").strip()
     if not text:
-        logger.warning("Empty final completion from model chain %s", models)
+        logger.warning("Empty final completion from model plan %s", plan)
         raise LLMError()
     return text
