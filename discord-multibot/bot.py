@@ -190,7 +190,7 @@ async def on_ready() -> None:
     # Guild-scoped sync for instant propagation (global sync can take ~1h).
     for guild in client.guilds:
         try:
-            tree.copy_global_to_guild(guild)
+            tree.copy_global_to(guild=guild)
             await tree.sync(guild=guild)
             logger.info("Synced app commands to guild %s (%s)", guild.name, guild.id)
         except discord.DiscordException:
