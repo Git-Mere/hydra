@@ -23,24 +23,49 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "channel_config.json")
 
-# Ordered default model fallback chain used for every channel. OpenRouter
-# accepts at most three server-side fallback models per request, so the client
-# batches this chain when calling chat/completions.
+# Ordered, speed-first default model fallback chain used for every channel.
+# Fast, reliable models lead; reasoning is turned off/low per model (see
+# MODEL_REASONING) so trivial translate/web-search turns don't waste seconds on
+# hidden chain-of-thought. OpenRouter accepts at most three server-side fallback
+# models per request, so the client batches this chain when calling
+# chat/completions.
 DEFAULT_MODEL_CHAIN = [
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "openai/gpt-oss-20b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-20b:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-4-31b-it:free",
 ]
+
+# Per-model reasoning body param (OpenRouter `reasoning` field). Verified facts:
+#  - nvidia/nemotron-*: {"enabled": false} disables reasoning cleanly (~0.5s).
+#  - openai/gpt-oss-*: reasoning is mandatory; {"enabled": false} 400s, so use
+#    {"effort": "low"}.
+#  - qwen / llama / gemma: leave unset (None) -- always safe.
+# Any model id not listed here (e.g. from a MODEL_CHAIN override) maps to None.
+MODEL_REASONING: dict[str, Optional[dict]] = {
+    "nvidia/nemotron-3-nano-30b-a3b:free": {"enabled": False},
+    "nvidia/nemotron-3-super-120b-a12b:free": {"enabled": False},
+    "openai/gpt-oss-20b:free": {"effort": "low"},
+    "qwen/qwen3-next-80b-a3b-instruct:free": None,
+    "meta-llama/llama-3.3-70b-instruct:free": None,
+    "google/gemma-4-31b-it:free": None,
+}
+
+# OpenRouter caps the server-side `models` fallback array at three per request.
+MAX_FALLBACK_MODELS = 3
 
 # Backward-compatible module-level fallback constant.
 DEFAULT_MODEL = DEFAULT_MODEL_CHAIN[0]
 
 # Allowed values, shared with the slash command choices.
-MODES = ("translate", "chat")
+MODES = ("translate", "websearch")
 TRIGGERS = ("auto", "mention")
+
+# Mode ids that have been renamed. Applied when loading persisted config so
+# channels configured under the old name keep working.
+_MODE_MIGRATIONS = {"chat": "websearch"}
 
 
 def get_model_chain() -> list[str]:
@@ -62,11 +87,36 @@ def get_default_model() -> str:
     return get_model_chain()[0]
 
 
+def get_model_plan() -> list[dict]:
+    """Return the model chain as an ordered list of reasoning-consistent batches.
+
+    Consecutive chain models that share the same reasoning param are grouped
+    together and each group is sliced to at most ``MAX_FALLBACK_MODELS`` models
+    (OpenRouter's fallback-array cap). Because reasoning is a per-request body
+    field, every model within one batch must share the same setting or a
+    fallback model could 400. Each batch is ``{"models": [...], "reasoning":
+    {..}|None}``. Unknown model ids (from a MODEL_CHAIN/DEFAULT_MODEL override)
+    map to ``None`` reasoning, which is always safe.
+    """
+    plan: list[dict] = []
+    for model in get_model_chain():
+        reasoning = MODEL_REASONING.get(model)
+        if (
+            plan
+            and plan[-1]["reasoning"] == reasoning
+            and len(plan[-1]["models"]) < MAX_FALLBACK_MODELS
+        ):
+            plan[-1]["models"].append(model)
+        else:
+            plan.append({"models": [model], "reasoning": reasoning})
+    return plan
+
+
 @dataclass(frozen=True)
 class ChannelConfig:
     """Resolved config for a single channel."""
 
-    mode: str          # "translate" | "chat"
+    mode: str          # "translate" | "websearch"
     trigger: str       # "auto" | "mention"
     enabled: bool = True
 
@@ -109,8 +159,11 @@ class JsonStore:
                 for channel_id, cfg in channels.items():
                     if not isinstance(cfg, dict) or "mode" not in cfg or "trigger" not in cfg:
                         continue
+                    # Migrate renamed mode ids (e.g. legacy "chat" -> "websearch")
+                    # so channels configured before the rename keep working.
+                    mode = _MODE_MIGRATIONS.get(cfg["mode"], cfg["mode"])
                     parsed_channels[str(channel_id)] = ChannelConfig(
-                        mode=cfg["mode"],
+                        mode=mode,
                         trigger=cfg["trigger"],
                         enabled=bool(cfg.get("enabled", True)),
                     )

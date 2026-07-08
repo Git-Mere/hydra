@@ -30,8 +30,8 @@ from config import (
     get_channel_config,
     set_channel_config,
 )
-from handlers import chat as chat_handler
 from handlers import translate as translate_handler
+from handlers import websearch as websearch_handler
 from llm.client import USER_FACING_ERROR, LLMError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -42,7 +42,7 @@ DISCORD_MAX_LEN = 2000
 # Handlers keyed by mode. Adding a mode = one entry here + a handler module.
 _HANDLERS = {
     "translate": translate_handler.handle,
-    "chat": chat_handler.handle,
+    "websearch": websearch_handler.handle,
 }
 
 # Custom Discord emoji: <:name:id> or animated <a:name:id>.
@@ -129,7 +129,7 @@ tree = app_commands.CommandTree(client)
 @app_commands.choices(
     mode=[
         app_commands.Choice(name="translate", value="translate"),
-        app_commands.Choice(name="chat", value="chat"),
+        app_commands.Choice(name="Web Searching", value="websearch"),
     ],
     trigger=[
         app_commands.Choice(name="auto (every message)", value="auto"),
@@ -235,8 +235,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # 6b + 7. Dispatch and reply, splitting long output. Never crash silently.
-    # Chat is async (MCP tool loop); translate stays sync and runs in a worker
-    # thread so its blocking OpenRouter call never stalls the event loop.
+    # Web searching is async (MCP tool loop); translate stays sync and runs in a
+    # worker thread so its blocking OpenRouter call never stalls the event loop.
     try:
         async with message.channel.typing():
             if asyncio.iscoroutinefunction(handler):

@@ -1,4 +1,4 @@
-"""Tavily web-search via its remote MCP server (chat mode only).
+"""Tavily web-search via its remote MCP server (web searching mode only).
 
 Connects to Tavily's hosted MCP endpoint over streamable HTTP, lists the
 server's tools, and exposes them as OpenAI/OpenRouter function schemas plus an
@@ -6,7 +6,7 @@ async executor the tool-call loop can drive.
 
 The API key comes from the ``TAVILY_API_KEY`` env var and is NEVER hardcoded.
 When it is unset, ``session`` raises ``TavilyUnavailable`` so the caller can
-fall back to a search-free answer (graceful degradation, spec requirement 2).
+tell the user web search is unavailable instead of answering from memory.
 
 Usage::
 
@@ -76,8 +76,9 @@ async def session():
     """Open a Tavily MCP session, yielding ``(tool_schemas, executor)``.
 
     Raises ``TavilyUnavailable`` if no API key is configured. Any connection or
-    protocol error propagates to the caller (chat degrades to a search-free
-    answer). The session and its transport are torn down on exit.
+    protocol error propagates to the caller (web searching mode then reports
+    that search is unavailable). The session and its transport are torn down on
+    exit.
     """
     url = _tavily_url()
     async with streamablehttp_client(url) as (read, write, _get_session_id):
