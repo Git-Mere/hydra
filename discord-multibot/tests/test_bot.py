@@ -72,11 +72,17 @@ class _FakeCompletions:
         self.calls = 0
         self.kwargs = []
 
-    def create(self, **kwargs):
+    def create(self, *, model, messages, tools=None, extra_body=None):
         import httpx
         from openai import RateLimitError
 
         self.calls += 1
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "extra_body": extra_body,
+        }
         self.kwargs.append(kwargs)
         if self.calls <= self.fail_times:
             resp = httpx.Response(429, request=httpx.Request("POST", "http://x"))
@@ -115,9 +121,15 @@ class _BatchFakeCompletions:
         self.served_model = served_model
         self.calls = []
 
-    def create(self, **kwargs):
+    def create(self, *, model, messages, tools=None, extra_body=None):
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "extra_body": extra_body,
+        }
         self.calls.append(kwargs)
-        batch = tuple(kwargs["models"])
+        batch = tuple(extra_body["models"])
         if batch in self.fail_batches:
             raise _rate_limit_error()
 
@@ -189,9 +201,11 @@ def test_429_batch_falls_through_to_next_batch():
         assert out == "from fallback"
         assert len(fc.calls) == 2
         assert fc.calls[0]["model"] == "m1"
-        assert fc.calls[0]["models"] == first_batch
+        assert fc.calls[0]["extra_body"]["models"] == first_batch
+        assert "models" not in fc.calls[0]
         assert fc.calls[1]["model"] == "m4"
-        assert fc.calls[1]["models"] == second_batch
+        assert fc.calls[1]["extra_body"]["models"] == second_batch
+        assert "models" not in fc.calls[1]
     finally:
         llm_client._client = None
 
@@ -223,7 +237,13 @@ def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
         def __init__(self):
             self.calls = []
 
-        def create(self, **kwargs):
+        def create(self, *, model, messages, tools=None, extra_body=None):
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "extra_body": extra_body,
+            }
             self.calls.append(kwargs)
             raise _rate_limit_error(headers={"Retry-After": "60"})
 
@@ -240,6 +260,8 @@ def test_full_chain_exhaustion_uses_capped_retry_after_backoff():
             raised = True
         assert raised
         assert len(fc.calls) == 2 * llm_client.MAX_RETRIES
+        assert fc.calls[0]["extra_body"]["models"] == ["m1", "m2", "m3"]
+        assert "models" not in fc.calls[0]
         assert slept == [8.0, 8.0]
     finally:
         llm_client.time.sleep = real_sleep

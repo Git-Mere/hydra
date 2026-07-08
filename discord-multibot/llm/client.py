@@ -96,6 +96,7 @@ def _retry_after_seconds(exc: RateLimitError, attempt: int) -> float:
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after is not None:
         try:
+            # OpenRouter sends numeric seconds; HTTP-date Retry-After values are ignored.
             return min(float(retry_after), MAX_BACKOFF_SECONDS)
         except (TypeError, ValueError):
             pass
@@ -133,7 +134,11 @@ def _create_completion(models: list[str], messages: list[dict], tools: Optional[
     for attempt in range(MAX_RETRIES):
         for batch in batches:
             try:
-                kwargs = {"model": batch[0], "models": batch, "messages": messages}
+                kwargs = {
+                    "model": batch[0],
+                    "messages": messages,
+                    "extra_body": {"models": batch},
+                }
                 if tools:
                     kwargs["tools"] = tools
                 resp = client.chat.completions.create(**kwargs)
@@ -155,7 +160,7 @@ def _create_completion(models: list[str], messages: list[dict], tools: Optional[
 
         # No point sleeping after the final full-chain pass.
         if attempt < MAX_RETRIES - 1:
-            delay = _retry_after_seconds(last_exc, attempt) if last_exc else 0.0
+            delay = _retry_after_seconds(last_exc, attempt)
             logger.warning(
                 "All OpenRouter model batches rate-limited (pass %d/%d); retrying in %.1fs",
                 attempt + 1,
@@ -163,7 +168,6 @@ def _create_completion(models: list[str], messages: list[dict], tools: Optional[
                 delay,
             )
             time.sleep(delay)
-            continue
 
     logger.error("Rate limit not cleared after %d full-chain passes", MAX_RETRIES)
     raise LLMError() from last_exc
