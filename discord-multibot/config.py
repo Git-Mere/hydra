@@ -38,6 +38,22 @@ DEFAULT_MODEL_CHAIN = [
     "nvidia/nemotron-3-nano-30b-a3b:free",
 ]
 
+# Websearch-specific fallback chain (evidence-based order from runtime
+# [websearch-diag] logs). Unlike the translate chain, this must NOT lead with
+# gpt-oss-20b: gpt-oss returns an HTTP-200 error body (500) on every tool-loop
+# iteration once the context grows, wasting 11-41s per iteration. So the order
+# leads with large-context instruct models that handle tool-calling well;
+# nemotron-super is proven to actually serve this workload in the logs; gpt-oss
+# is LAST because it 500s on large tool contexts. (nemotron-nano is dropped for
+# websearch -- weak and unnecessary for this workload.)
+WEBSEARCH_MODEL_CHAIN = [
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "openai/gpt-oss-20b:free",
+]
+
 # Per-model reasoning body param (OpenRouter `reasoning` field). Verified facts:
 #  - nvidia/nemotron-*: {"enabled": false} disables reasoning cleanly (~0.5s).
 #  - openai/gpt-oss-*: reasoning is mandatory; {"enabled": false} 400s, so use
@@ -90,19 +106,35 @@ def get_default_model() -> str:
     return get_model_chain()[0]
 
 
-def get_model_plan() -> list[dict]:
-    """Return the model chain as an ordered list of reasoning-consistent batches.
+def get_websearch_model_chain() -> list[str]:
+    """Return the ordered model chain used for websearch mode.
+
+    Mirrors get_model_chain()'s env handling but is scoped to websearch: an
+    optional ``WEBSEARCH_MODEL_CHAIN`` env var (comma-separated) overrides the
+    constant. The translate envs (DEFAULT_MODEL / MODEL_CHAIN) are deliberately
+    NOT consulted here so translate config cannot perturb the websearch order.
+    """
+    env_chain = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    if env_chain is not None:
+        chain = [model.strip() for model in env_chain.split(",") if model.strip()]
+        return chain or list(WEBSEARCH_MODEL_CHAIN)
+
+    return list(WEBSEARCH_MODEL_CHAIN)
+
+
+def _build_plan(chain: list[str]) -> list[dict]:
+    """Group a model chain into an ordered list of reasoning-consistent batches.
 
     Consecutive chain models that share the same reasoning param are grouped
     together and each group is sliced to at most ``MAX_FALLBACK_MODELS`` models
     (OpenRouter's fallback-array cap). Because reasoning is a per-request body
     field, every model within one batch must share the same setting or a
     fallback model could 400. Each batch is ``{"models": [...], "reasoning":
-    {..}|None}``. Unknown model ids (from a MODEL_CHAIN/DEFAULT_MODEL override)
-    map to ``None`` reasoning, which is always safe.
+    {..}|None}``. Unknown model ids (from an env override) map to ``None``
+    reasoning, which is always safe.
     """
     plan: list[dict] = []
-    for model in get_model_chain():
+    for model in chain:
         reasoning = MODEL_REASONING.get(model)
         if (
             plan
@@ -113,6 +145,16 @@ def get_model_plan() -> list[dict]:
         else:
             plan.append({"models": [model], "reasoning": reasoning})
     return plan
+
+
+def get_model_plan() -> list[dict]:
+    """Return the translate model chain as reasoning-consistent batches."""
+    return _build_plan(get_model_chain())
+
+
+def get_websearch_model_plan() -> list[dict]:
+    """Return the websearch model chain as reasoning-consistent batches."""
+    return _build_plan(get_websearch_model_chain())
 
 
 @dataclass(frozen=True)

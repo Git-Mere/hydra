@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from config import ChannelConfig, get_model_plan
+from config import ChannelConfig, get_websearch_model_plan
 from llm import client, tavily_search
 from llm.client import LLMError
 from llm.prompts import WEBSEARCH_SYSTEM
@@ -49,7 +49,7 @@ async def handle(cfg: ChannelConfig, text: str) -> str:
     when Tavily cannot be reached. Raises llm.client.LLMError on model failure
     (caller posts a guidance message).
     """
-    plan = get_model_plan()
+    plan = get_websearch_model_plan()
     # None until we get a search-backed answer. Kept outside the `with` so a
     # teardown error while closing the MCP session cannot discard a good answer.
     answer: str | None = None
