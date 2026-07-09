@@ -92,7 +92,16 @@ async def session():
                 result = await mcp_session.call_tool(name, arguments)
                 text = _result_to_text(result)
                 if getattr(result, "isError", False):
-                    logger.warning("Tavily tool %s reported an error", name)
+                    # Surface the real Tavily error and the args that caused it,
+                    # and hand the model an explicit marker so it can self-correct
+                    # (never a bare "(no result)", which reads as a valid answer).
+                    logger.warning(
+                        "Tavily tool %s reported an error (args=%r): %s",
+                        name,
+                        arguments,
+                        text,
+                    )
+                    return f"Tool error: {text or '(no details)'}"
                 return text or "(no result)"
 
             yield schemas, executor
