@@ -141,6 +141,24 @@ def _create_completion(plan: list[dict], messages: list[dict], tools: Optional[l
                 if tools:
                     kwargs["tools"] = tools
                 resp = client.chat.completions.create(**kwargs)
+                if resp is None or not getattr(resp, "choices", None):
+                    # OpenRouter sometimes returns HTTP 200 whose body is an
+                    # error object (no completion). resp.choices is None/empty.
+                    # Surface the real cause, then treat it as a soft, retryable
+                    # failure so the remaining fallback batches still get a try.
+                    error = getattr(resp, "error", None)
+                    if error is None:
+                        extra = getattr(resp, "model_extra", None)
+                        if isinstance(extra, dict):
+                            error = extra.get("error")
+                    logger.warning(
+                        "OpenRouter returned no choices for batch %s: %r",
+                        models,
+                        error,
+                    )
+                    last_exc = LLMError(f"OpenRouter returned no choices: {error!r}")
+                    continue
+
                 logger.info("OpenRouter completion served by model %s", resp.model)
                 return resp.choices[0].message
 
