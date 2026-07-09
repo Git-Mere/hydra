@@ -107,9 +107,9 @@ async def session():
                 # Remove once the tool-loop cap root cause is found.
                 logger.info(
                     "[websearch-diag] tavily result for %s: len=%d snippet=%r",
-                    arguments,
-                    len(text),
-                    text[:300],
+                    str(arguments)[:300],
+                    len(text or ""),
+                    (text or "")[:300],
                 )
                 return text or "(no result)"
 

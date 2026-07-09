@@ -283,7 +283,7 @@ async def complete_with_tools(
                 logger.info(
                     "[websearch-diag] tool_call name=%s args=%r",
                     tc.function.name,
-                    tc.function.arguments,
+                    str(tc.function.arguments)[:300],
                 )
                 logger.warning(
                     "Tool %s called with invalid JSON arguments: %r",
@@ -295,7 +295,7 @@ async def complete_with_tools(
                 logger.info(
                     "[websearch-diag] tool_call name=%s args=%r",
                     tc.function.name,
-                    arguments,
+                    str(arguments)[:300],
                 )
                 try:
                     result = await tool_executor(tc.function.name, arguments)
