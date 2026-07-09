@@ -245,15 +245,27 @@ async def complete_with_tools(
 
         messages.append(_assistant_message_dict(message))
         for tc in message.tool_calls:
+            raw_args = tc.function.arguments or "{}"
             try:
-                arguments = json.loads(tc.function.arguments or "{}")
+                arguments = json.loads(raw_args)
+                valid_args = isinstance(arguments, dict)
             except (json.JSONDecodeError, TypeError):
-                arguments = {}
-            try:
-                result = await tool_executor(tc.function.name, arguments)
-            except Exception as exc:  # noqa: BLE001 -- keep answering without the tool
-                logger.warning("Tool %s failed: %s", tc.function.name, exc)
-                result = f"Tool error: {exc}"
+                valid_args = False
+            if not valid_args:
+                # Bad tool args: don't call the tool with {} (Tavily would reject
+                # the empty query). Feed the error back so the model retries.
+                logger.warning(
+                    "Tool %s called with invalid JSON arguments: %r",
+                    tc.function.name,
+                    tc.function.arguments,
+                )
+                result = f"Tool error: arguments were not valid JSON: {raw_args}"
+            else:
+                try:
+                    result = await tool_executor(tc.function.name, arguments)
+                except Exception as exc:  # noqa: BLE001 -- keep answering without the tool
+                    logger.warning("Tool %s failed: %s", tc.function.name, exc)
+                    result = f"Tool error: {exc}"
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )

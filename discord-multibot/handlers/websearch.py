@@ -30,6 +30,18 @@ WEBSEARCH_UNAVAILABLE_MESSAGE = (
 )
 
 
+def _find_llm_error(exc: BaseException) -> LLMError | None:
+    """Return the first LLMError inside ``exc`` (possibly a nested group), or None."""
+    if isinstance(exc, LLMError):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            found = _find_llm_error(sub)
+            if found is not None:
+                return found
+    return None
+
+
 async def handle(cfg: ChannelConfig, text: str) -> str:
     """Answer ``text`` in Korean from web-search results.
 
@@ -50,6 +62,16 @@ async def handle(cfg: ChannelConfig, text: str) -> str:
     except tavily_search.TavilyUnavailable:
         # No API key configured: web search is off, no noise in the log.
         logger.info("TAVILY_API_KEY not set; web search unavailable")
+    except BaseExceptionGroup as eg:  # noqa: BLE001 -- anyio teardown wraps errors
+        # anyio's MCP session teardown re-wraps the in-context exception into a
+        # group, so a real model failure arrives as a BaseExceptionGroup rather
+        # than a bare LLMError. Unwrap it: an inner LLMError must propagate as an
+        # LLMError (bot posts model-failure guidance), not the Tavily message.
+        llm_error = _find_llm_error(eg)
+        if llm_error is not None:
+            raise llm_error from eg
+        # No model failure inside: a genuine MCP/teardown failure -> unavailable.
+        logger.exception("Tavily MCP unavailable; web search unavailable")
     except Exception:  # noqa: BLE001 -- MCP connection/protocol/teardown error
         logger.exception("Tavily MCP unavailable; web search unavailable")
 

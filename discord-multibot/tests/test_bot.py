@@ -458,6 +458,41 @@ def test_tool_loop_tool_error_is_fed_back():
     assert tool_msgs and "Tool error" in tool_msgs[0]["content"]
 
 
+def test_tool_loop_invalid_json_args_feeds_error_and_skips_tool():
+    """Unparseable tool arguments must NOT invoke the tool with {}; instead a
+    'Tool error' message is fed back so the model can retry with valid args."""
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", "{not valid json")]),
+        _FakeMsg(content="recovered answer"),
+    ]
+    seen = []
+
+    def fake_create(models, messages, tools=None):
+        seen.append(_snapshot(messages))
+        return responses[len(seen) - 1]
+
+    executor_calls = []
+
+    async def executor(name, arguments):
+        executor_calls.append((name, arguments))
+        return "should not run"
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    assert out == "recovered answer"
+    # The tool was NOT called (never with {} from unparseable args).
+    assert executor_calls == []
+    tool_msgs = [m for m in seen[1] if m.get("role") == "tool"]
+    assert tool_msgs and "Tool error" in tool_msgs[0]["content"]
+
+
 def test_websearch_without_tavily_key_returns_unavailable():
     prev_key = os.environ.pop("TAVILY_API_KEY", None)
     prev_complete = llm_client.complete
@@ -545,6 +580,129 @@ def test_websearch_keeps_answer_despite_session_teardown_error():
         llm_client.complete_with_tools = prev_cwt
         llm_client.complete = prev_complete
         _restore_tavily_key(prev_key)
+
+
+def test_websearch_llmerror_in_group_reraises_as_llmerror():
+    """An LLMError raised inside the session context is re-wrapped by anyio
+    teardown into a BaseExceptionGroup. handle() must unwrap it and re-raise the
+    LLMError (so the bot posts model-failure guidance) -- NOT the unavailable msg."""
+    import pytest
+    from contextlib import asynccontextmanager
+
+    prev_key = _set_tavily_key()
+    prev_session = tavily_search.session
+    prev_cwt = llm_client.complete_with_tools
+    prev_complete = llm_client.complete
+
+    @asynccontextmanager
+    async def group_wrapping_session():
+        async def executor(name, arguments):
+            return ""
+        try:
+            yield ([], executor)
+        except BaseException as exc:
+            # anyio re-wraps the in-context error into a group on teardown.
+            raise BaseExceptionGroup("session teardown", [exc]) from None
+
+    async def raise_llmerror(plan, system, text, tools, executor):
+        raise llm_client.LLMError("model boom")
+
+    tavily_search.session = group_wrapping_session
+    llm_client.complete_with_tools = raise_llmerror
+    # complete() must NOT be called: this is a model failure, not a fallback.
+    llm_client.complete = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("memory fallback used")
+    )
+    try:
+        cfg = config.ChannelConfig("websearch", "auto", True)
+        with pytest.raises(llm_client.LLMError) as ei:
+            asyncio.run(websearch_handler.handle(cfg, "hi"))
+        assert ei.value.user_message == "model boom"
+    finally:
+        tavily_search.session = prev_session
+        llm_client.complete_with_tools = prev_cwt
+        llm_client.complete = prev_complete
+        _restore_tavily_key(prev_key)
+
+
+class _FakeContentBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeCallResult:
+    def __init__(self, texts, is_error):
+        self.content = [_FakeContentBlock(t) for t in texts]
+        self.isError = is_error
+
+
+class _FakeMcpSession:
+    def __init__(self, read, write):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def initialize(self):
+        pass
+
+    async def list_tools(self):
+        return type("Listed", (), {"tools": []})()
+
+    async def call_tool(self, name, arguments):
+        return _FakeCallResult(["Tavily: query is required"], is_error=True)
+
+
+class _FakeHttpClient:
+    def __init__(self, url):
+        pass
+
+    async def __aenter__(self):
+        return (None, None, None)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_tavily_executor_iserror_returns_marker_and_logs():
+    """An isError tool result returns a 'Tool error' marker (not '(no result)')
+    and the real error text is logged."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    tavily_search.logger.addHandler(handler)
+    prev_level = tavily_search.logger.level
+    tavily_search.logger.setLevel(logging.WARNING)
+
+    prev_key = _set_tavily_key()
+    prev_http = tavily_search.streamablehttp_client
+    prev_session_cls = tavily_search.ClientSession
+    tavily_search.streamablehttp_client = lambda url: _FakeHttpClient(url)
+    tavily_search.ClientSession = _FakeMcpSession
+
+    async def run():
+        async with tavily_search.session() as (tools, executor):
+            return await executor("tavily_search", {"query": ""})
+
+    try:
+        out = asyncio.run(run())
+        assert "Tool error" in out
+        assert out != "(no result)"
+        messages = " ".join(r.getMessage() for r in records)
+        assert "Tavily: query is required" in messages
+    finally:
+        tavily_search.streamablehttp_client = prev_http
+        tavily_search.ClientSession = prev_session_cls
+        _restore_tavily_key(prev_key)
+        tavily_search.logger.removeHandler(handler)
+        tavily_search.logger.setLevel(prev_level)
 
 
 # --- JSON config store -------------------------------------------------------
