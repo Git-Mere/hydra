@@ -35,6 +35,10 @@ MAX_RETRIES = 3               # full-chain passes on 429 before giving up
 BACKOFF_BASE = 2.0           # seconds; sleep = BACKOFF_BASE * 2**attempt
 MAX_TOOL_ITERATIONS = 4       # cap on model<->tool round-trips in web searching mode
 MAX_BACKOFF_SECONDS = 8.0
+# Cap on the tool-result string fed back into the model each iteration. Tavily
+# results are huge (search ~15-20K chars, extract ~89K chars); feeding the full
+# blob back every round bloats context and slows inference. Truncate to this cap.
+MAX_TOOL_RESULT_CHARS = 6000
 
 # Short, user-facing guidance. Handlers/bot post this on failure.
 USER_FACING_ERROR = "⚠️ 지금은 응답할 수 없어요. 잠시 후 다시 시도해 주세요."
@@ -303,9 +307,15 @@ async def complete_with_tools(
                     logger.warning("Tool %s failed: %s", tc.function.name, exc)
                     result = f"Tool error: {exc}"
             tool_calls_made += 1
+            original_len = len(result)
+            if original_len > MAX_TOOL_RESULT_CHARS:
+                result = result[:MAX_TOOL_RESULT_CHARS] + (
+                    f"\n...[truncated {original_len - MAX_TOOL_RESULT_CHARS} chars]"
+                )
             logger.info(
-                "[websearch-diag] tool_result name=%s len=%d snippet=%r",
+                "[websearch-diag] tool_result name=%s original_len=%d fed_len=%d snippet=%r",
                 tc.function.name,
+                original_len,
                 len(result),
                 result[:300],
             )

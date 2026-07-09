@@ -630,6 +630,108 @@ def test_tool_loop_invalid_json_args_feeds_error_and_skips_tool():
     assert tool_msgs and "Tool error" in tool_msgs[0]["content"]
 
 
+def test_tool_loop_truncates_large_tool_result():
+    """A tool result longer than MAX_TOOL_RESULT_CHARS is truncated in the
+    message fed back to the model; a short result is passed through unchanged."""
+    big = "x" * (llm_client.MAX_TOOL_RESULT_CHARS + 5000)
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", '{"query": "q"}')]),
+        _FakeMsg(content="done"),
+    ]
+    seen = []
+
+    def fake_create(models, messages, tools=None):
+        seen.append(_snapshot(messages))
+        return responses[len(seen) - 1]
+
+    async def executor(name, arguments):
+        return big
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    assert out == "done"
+    tool_msgs = [m for m in seen[1] if m.get("role") == "tool"]
+    assert tool_msgs
+    fed = tool_msgs[0]["content"]
+    # Truncated to the cap plus a short marker; original size is not fed back.
+    assert len(big) > llm_client.MAX_TOOL_RESULT_CHARS
+    assert len(fed) <= llm_client.MAX_TOOL_RESULT_CHARS + 60
+    assert "truncated" in fed
+
+
+def test_tool_loop_short_result_passed_through_unchanged():
+    short = "small result"
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", '{"query": "q"}')]),
+        _FakeMsg(content="done"),
+    ]
+    seen = []
+
+    def fake_create(models, messages, tools=None):
+        seen.append(_snapshot(messages))
+        return responses[len(seen) - 1]
+
+    async def executor(name, arguments):
+        return short
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        asyncio.run(
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+
+    tool_msgs = [m for m in seen[1] if m.get("role") == "tool"]
+    assert tool_msgs and tool_msgs[0]["content"] == short
+
+
+def test_websearch_handler_uses_websearch_model_plan():
+    """The handler must pass the websearch plan (from get_websearch_model_plan)
+    into complete_with_tools -- not the translate plan."""
+    from contextlib import asynccontextmanager
+
+    prev_key = _set_tavily_key()
+    prev_session = tavily_search.session
+    prev_cwt = llm_client.complete_with_tools
+    prev_plan_fn = websearch_handler.get_websearch_model_plan
+
+    sentinel = [{"models": ["qwen/qwen3-next-80b-a3b-instruct:free"], "reasoning": None}]
+    received = {}
+
+    @asynccontextmanager
+    async def clean_session():
+        async def executor(name, arguments):
+            return ""
+        yield ([], executor)
+
+    async def capture_cwt(plan, system, text, tools, executor):
+        received["plan"] = plan
+        return "answer"
+
+    tavily_search.session = clean_session
+    llm_client.complete_with_tools = capture_cwt
+    websearch_handler.get_websearch_model_plan = lambda: sentinel
+    try:
+        cfg = config.ChannelConfig("websearch", "auto", True)
+        out = asyncio.run(websearch_handler.handle(cfg, "hi"))
+        assert out == "answer"
+        assert received["plan"] is sentinel
+    finally:
+        tavily_search.session = prev_session
+        llm_client.complete_with_tools = prev_cwt
+        websearch_handler.get_websearch_model_plan = prev_plan_fn
+        _restore_tavily_key(prev_key)
+
+
 def test_websearch_without_tavily_key_returns_unavailable():
     prev_key = os.environ.pop("TAVILY_API_KEY", None)
     prev_complete = llm_client.complete
@@ -1080,6 +1182,98 @@ def test_model_plan_default_batches_by_reasoning():
         ]
     finally:
         _restore_model_env(prev_default, prev_chain)
+
+
+def _restore_websearch_chain_env(prev):
+    if prev is None:
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+    else:
+        os.environ["WEBSEARCH_MODEL_CHAIN"] = prev
+
+
+def test_websearch_model_plan_leads_with_qwen_and_gpt_oss_last():
+    """The websearch plan must NOT lead with gpt-oss (it 500s on large tool
+    contexts): first batch leads with qwen, gpt-oss is in the LAST batch only.
+    Batching still respects reasoning grouping and the <=3 fallback cap."""
+    prev = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    try:
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+        plan = config.get_websearch_model_plan()
+        # First batch leads with qwen.
+        assert plan[0]["models"][0] == "qwen/qwen3-next-80b-a3b-instruct:free"
+        # gpt-oss is absent from the first batch and present in the last.
+        assert "openai/gpt-oss-20b:free" not in plan[0]["models"]
+        assert "openai/gpt-oss-20b:free" in plan[-1]["models"]
+        # Every batch respects the fallback cap and reasoning grouping.
+        for batch in plan:
+            assert len(batch["models"]) <= config.MAX_FALLBACK_MODELS
+            reasonings = {repr(config.MODEL_REASONING.get(m)) for m in batch["models"]}
+            # A batch mixing None with {} would be a set of size 2 (illegal).
+            assert len(reasonings) == 1
+    finally:
+        _restore_websearch_chain_env(prev)
+
+
+def test_websearch_model_plan_exact_batches():
+    prev = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    try:
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+        plan = config.get_websearch_model_plan()
+        assert plan == [
+            {
+                "models": [
+                    "qwen/qwen3-next-80b-a3b-instruct:free",
+                    "meta-llama/llama-3.3-70b-instruct:free",
+                ],
+                "reasoning": None,
+            },
+            {
+                "models": ["nvidia/nemotron-3-super-120b-a12b:free"],
+                "reasoning": {"enabled": False},
+            },
+            {
+                "models": ["google/gemma-4-31b-it:free"],
+                "reasoning": None,
+            },
+            {
+                "models": ["openai/gpt-oss-20b:free"],
+                "reasoning": {"effort": "low"},
+            },
+        ]
+    finally:
+        _restore_websearch_chain_env(prev)
+
+
+def test_websearch_model_chain_env_override_is_honored():
+    prev = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_translate_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ["WEBSEARCH_MODEL_CHAIN"] = " vendor/x , ,vendor/y "
+        # Translate envs must NOT leak into the websearch chain.
+        os.environ["DEFAULT_MODEL"] = "ignored/default"
+        os.environ["MODEL_CHAIN"] = "ignored/a,ignored/b"
+        assert config.get_websearch_model_chain() == ["vendor/x", "vendor/y"]
+    finally:
+        _restore_websearch_chain_env(prev)
+        _restore_model_env(prev_default, prev_translate_chain)
+
+
+def test_translate_plan_still_leads_with_gpt_oss():
+    """Guard against shared-state regressions: translate's plan is unchanged and
+    still leads with openai/gpt-oss-20b:free."""
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    prev_ws = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+        plan = config.get_model_plan()
+        assert plan[0]["models"][0] == "openai/gpt-oss-20b:free"
+    finally:
+        _restore_model_env(prev_default, prev_chain)
+        _restore_websearch_chain_env(prev_ws)
 
 
 def test_model_plan_unknown_ids_map_to_no_reasoning_and_slice_by_three():
