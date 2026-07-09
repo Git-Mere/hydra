@@ -1159,6 +1159,93 @@ def test_setup_requires_manage_channels():
         assert raised
 
 
+def test_tool_loop_emits_websearch_diag_logs():
+    """[websearch-diag] instrumentation: a successful tool call must log the
+    query args and a truncated tool_result snippet on llm.client.logger."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    llm_client.logger.addHandler(handler)
+    previous_level = llm_client.logger.level
+    llm_client.logger.setLevel(logging.INFO)
+
+    responses = [
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", '{"query": "Mayor of Redmond"}')]),
+        _FakeMsg(content="The mayor is ..."),
+    ]
+    seen = []
+
+    def fake_create(models, messages, tools=None):
+        seen.append(tools)
+        return responses[len(seen) - 1]
+
+    async def executor(name, arguments):
+        return "Angela Birney is the Mayor of Redmond"
+
+    prev = llm_client._create_completion
+    llm_client._create_completion = fake_create
+    try:
+        out = asyncio.run(
+            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
+        )
+    finally:
+        llm_client._create_completion = prev
+        llm_client.logger.removeHandler(handler)
+        llm_client.logger.setLevel(previous_level)
+
+    assert out == "The mayor is ..."
+    messages = [r.getMessage() for r in records]
+    # The query the model sent is visible in a tool_call diag record.
+    assert any("[websearch-diag] tool_call" in m and "Mayor of Redmond" in m for m in messages)
+    # What was fed back to the model is visible in a tool_result diag record.
+    assert any("[websearch-diag] tool_result" in m and "Angela Birney" in m for m in messages)
+
+
+def test_tavily_executor_success_path_emits_websearch_diag_log():
+    """[websearch-diag] instrumentation: the tavily executor success path logs a
+    'tavily result' record with the returned text snippet."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    tavily_search.logger.addHandler(handler)
+    prev_level = tavily_search.logger.level
+    tavily_search.logger.setLevel(logging.INFO)
+
+    class _OkMcpSession(_FakeMcpSession):
+        async def call_tool(self, name, arguments):
+            return _FakeCallResult(["Angela Birney is the Mayor of Redmond"], is_error=False)
+
+    prev_key = _set_tavily_key()
+    prev_http = tavily_search.streamablehttp_client
+    prev_session_cls = tavily_search.ClientSession
+    tavily_search.streamablehttp_client = lambda url: _FakeHttpClient(url)
+    tavily_search.ClientSession = _OkMcpSession
+
+    async def run():
+        async with tavily_search.session() as (tools, executor):
+            return await executor("tavily_search", {"query": "Mayor of Redmond"})
+
+    try:
+        out = asyncio.run(run())
+        assert "Angela Birney" in out
+        messages = [r.getMessage() for r in records]
+        assert any("[websearch-diag] tavily result" in m and "Angela Birney" in m for m in messages)
+    finally:
+        tavily_search.streamablehttp_client = prev_http
+        tavily_search.ClientSession = prev_session_cls
+        _restore_tavily_key(prev_key)
+        tavily_search.logger.removeHandler(handler)
+        tavily_search.logger.setLevel(prev_level)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
