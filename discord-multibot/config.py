@@ -62,6 +62,9 @@ DEFAULT_MODEL = DEFAULT_MODEL_CHAIN[0]
 # Allowed values, shared with the slash command choices.
 MODES = ("translate", "websearch")
 TRIGGERS = ("auto", "mention")
+# Translation tone (translate mode only). Default is "casual".
+TONES = ("casual", "polite")
+DEFAULT_TONE = "casual"
 
 # Mode ids that have been renamed. Applied when loading persisted config so
 # channels configured under the old name keep working.
@@ -119,6 +122,7 @@ class ChannelConfig:
     mode: str          # "translate" | "websearch"
     trigger: str       # "auto" | "mention"
     enabled: bool = True
+    tone: str = "casual"   # "casual" | "polite"; only meaningful for translate
 
 
 class JsonStore:
@@ -162,10 +166,16 @@ class JsonStore:
                     # Migrate renamed mode ids (e.g. legacy "chat" -> "websearch")
                     # so channels configured before the rename keep working.
                     mode = _MODE_MIGRATIONS.get(cfg["mode"], cfg["mode"])
+                    # Migrate pre-tone channels: absent tone -> "casual". Any
+                    # unknown/invalid stored value also normalizes to "casual".
+                    tone = cfg.get("tone", DEFAULT_TONE)
+                    if tone not in TONES:
+                        tone = DEFAULT_TONE
                     parsed_channels[str(channel_id)] = ChannelConfig(
                         mode=mode,
                         trigger=cfg["trigger"],
                         enabled=bool(cfg.get("enabled", True)),
+                        tone=tone,
                     )
                 if parsed_channels:
                     parsed[str(guild_id)] = parsed_channels
@@ -178,6 +188,7 @@ class JsonStore:
                     "mode": cfg.mode,
                     "trigger": cfg.trigger,
                     "enabled": cfg.enabled,
+                    "tone": cfg.tone,
                 }
                 for channel_id, cfg in channels.items()
             }
@@ -210,9 +221,10 @@ class JsonStore:
         mode: str,
         trigger: str,
         enabled: bool = True,
+        tone: str = "casual",
     ) -> ChannelConfig:
         """Create or replace a channel's config and persist. Returns the config."""
-        cfg = ChannelConfig(mode=mode, trigger=trigger, enabled=enabled)
+        cfg = ChannelConfig(mode=mode, trigger=trigger, enabled=enabled, tone=tone)
         self._guilds.setdefault(str(guild_id), {})[str(channel_id)] = cfg
         self._save()
         return cfg
@@ -224,7 +236,7 @@ class JsonStore:
             return False
         existing = channels[str(channel_id)]
         channels[str(channel_id)] = ChannelConfig(
-            mode=existing.mode, trigger=existing.trigger, enabled=False
+            mode=existing.mode, trigger=existing.trigger, enabled=False, tone=existing.tone
         )
         self._save()
         return True
@@ -250,10 +262,10 @@ def get_channel_config(guild_id: int | str, channel_id: int | str) -> Optional[C
 
 
 def set_channel_config(
-    guild_id: int | str, channel_id: int | str, mode: str, trigger: str
+    guild_id: int | str, channel_id: int | str, mode: str, trigger: str, tone: str = "casual"
 ) -> ChannelConfig:
     """Enable and configure a channel (called by /setup)."""
-    return _get_store().set(guild_id, channel_id, mode, trigger, enabled=True)
+    return _get_store().set(guild_id, channel_id, mode, trigger, enabled=True, tone=tone)
 
 
 def disable_channel(guild_id: int | str, channel_id: int | str) -> bool:

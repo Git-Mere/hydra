@@ -125,7 +125,11 @@ tree = app_commands.CommandTree(client)
 
 
 @tree.command(name="setup", description="Enable and configure this bot in the current channel.")
-@app_commands.describe(mode="What the bot does here", trigger="When the bot responds")
+@app_commands.describe(
+    mode="What the bot does here",
+    trigger="When the bot responds",
+    tone="Translation tone (translate mode only; default casual)",
+)
 @app_commands.choices(
     mode=[
         app_commands.Choice(name="translate", value="translate"),
@@ -135,23 +139,34 @@ tree = app_commands.CommandTree(client)
         app_commands.Choice(name="auto (every message)", value="auto"),
         app_commands.Choice(name="mention (only when @mentioned)", value="mention"),
     ],
+    tone=[
+        app_commands.Choice(name="casual (반말)", value="casual"),
+        app_commands.Choice(name="polite (존댓말)", value="polite"),
+    ],
 )
 @app_commands.checks.has_permissions(manage_channels=True)
 async def setup_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     trigger: app_commands.Choice[str],
+    tone: app_commands.Choice[str] | None = None,
 ) -> None:
     if interaction.guild_id is None:
         await interaction.response.send_message(
             "This command can only be used in a server channel.", ephemeral=True
         )
         return
-    set_channel_config(interaction.guild_id, interaction.channel_id, mode.value, trigger.value)
-    await interaction.response.send_message(
-        f"✅ This channel is now **{mode.value}** mode, trigger **{trigger.value}**.",
-        ephemeral=True,
+    # tone is optional and only meaningful for translate mode; default casual.
+    tone_value = tone.value if tone is not None else "casual"
+    set_channel_config(
+        interaction.guild_id, interaction.channel_id, mode.value, trigger.value, tone=tone_value
     )
+    msg = f"✅ This channel is now **{mode.value}** mode, trigger **{trigger.value}**"
+    if mode.value == "translate":
+        msg += f", tone **{tone_value}**"
+    elif tone is not None:
+        msg += " (tone only applies to translate mode)"
+    await interaction.response.send_message(msg + ".", ephemeral=True)
 
 
 @tree.command(name="setup-off", description="Disable this bot in the current channel.")
