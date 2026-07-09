@@ -147,6 +147,50 @@ class _BatchFakeCompletions:
         return response
 
 
+class _NullChoicesFakeCompletions:
+    """Returns a response whose body was an OpenRouter error object: choices is
+    None (and an `error` attr set), then a valid reply on the next batch. This
+    reproduces the HTTP-200-error-body case that used to raise TypeError."""
+
+    def __init__(self, null_batches, reply="ok", served_model="served-model",
+                 error=None):
+        self.null_batches = [tuple(batch) for batch in null_batches]
+        self.reply = reply
+        self.served_model = served_model
+        self.error = error or {"message": "Provider returned error", "code": 503}
+        self.calls = []
+
+    def create(self, *, model, messages, tools=None, extra_body=None):
+        self.calls.append({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "extra_body": extra_body,
+        })
+        batch = tuple(extra_body["models"])
+        if batch in self.null_batches:
+            class _Resp:
+                choices = None
+
+            response = _Resp()
+            response.model = None
+            response.error = self.error
+            return response
+
+        class _Msg:
+            content = self.reply
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        response = _Resp()
+        response.model = self.served_model
+        return response
+
+
 class _FakeClient:
     def __init__(self, fake_completions):
         self.chat = type("Chat", (), {"completions": fake_completions})()
@@ -310,6 +354,99 @@ def test_create_completion_delivers_per_batch_reasoning_in_extra_body():
         assert nemotron_call["extra_body"]["reasoning"] == {"enabled": False}
     finally:
         _restore_model_env(prev_default, prev_chain)
+        llm_client._client = None
+
+
+def test_null_choices_batch_falls_through_to_next_batch():
+    """An HTTP-200-error-body response (choices=None) must NOT raise TypeError;
+    the loop treats it as a soft failure and uses the next fallback batch."""
+    first_batch = ["m1", "m2", "m3"]
+    second_batch = ["m4", "m5", "m6"]
+    fc = _NullChoicesFakeCompletions(
+        null_batches=[first_batch], reply="from fallback"
+    )
+    _install_fake_client(fc)
+    try:
+        message = llm_client._create_completion(
+            _plan(first_batch, second_batch), [{"role": "user", "content": "hi"}]
+        )
+        assert (message.content or "").strip() == "from fallback"
+        assert len(fc.calls) == 2
+        assert fc.calls[0]["extra_body"]["models"] == first_batch
+        assert fc.calls[1]["extra_body"]["models"] == second_batch
+    finally:
+        llm_client._client = None
+
+
+def test_all_null_choices_raises_llmerror_and_logs_error_payload():
+    """When every batch returns choices=None, _create_completion raises LLMError
+    (not TypeError) and the OpenRouter error payload is logged."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    llm_client.logger.addHandler(handler)
+    previous_level = llm_client.logger.level
+    llm_client.logger.setLevel(logging.WARNING)
+
+    real_sleep = llm_client.time.sleep
+    llm_client.time.sleep = lambda s: None
+    both = [["m1"], ["m2"]]
+    fc = _NullChoicesFakeCompletions(
+        null_batches=both, error={"message": "upstream boom", "code": 502}
+    )
+    _install_fake_client(fc)
+    try:
+        raised = False
+        try:
+            llm_client._create_completion(
+                _plan(*both), [{"role": "user", "content": "hi"}]
+            )
+        except llm_client.LLMError:
+            raised = True
+        assert raised
+        assert any("upstream boom" in r.getMessage() for r in records)
+    finally:
+        llm_client.time.sleep = real_sleep
+        llm_client.logger.removeHandler(handler)
+        llm_client.logger.setLevel(previous_level)
+        llm_client._client = None
+
+
+def test_served_model_not_logged_for_null_choices():
+    """The 'served by model' success line must only appear for a valid response,
+    never with a None model on the error-body path."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Handler()
+    llm_client.logger.addHandler(handler)
+    previous_level = llm_client.logger.level
+    llm_client.logger.setLevel(logging.INFO)
+
+    first_batch = ["m1"]
+    second_batch = ["m2"]
+    fc = _NullChoicesFakeCompletions(
+        null_batches=[first_batch], reply="ok", served_model="actual/model:free"
+    )
+    _install_fake_client(fc)
+    try:
+        message = llm_client._create_completion(
+            _plan(first_batch, second_batch), [{"role": "user", "content": "hi"}]
+        )
+        assert (message.content or "").strip() == "ok"
+        served = [r.getMessage() for r in records if "served by model" in r.getMessage()]
+        assert served == ["OpenRouter completion served by model actual/model:free"]
+        assert not any("served by model None" in m for m in served)
+    finally:
+        llm_client.logger.removeHandler(handler)
+        llm_client.logger.setLevel(previous_level)
         llm_client._client = None
 
 
