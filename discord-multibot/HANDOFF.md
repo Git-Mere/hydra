@@ -412,10 +412,18 @@ git push origin feat/gemini-provider            # 이상 없으면
 - 수정: `llm/client.py` `_assistant_message_dict`가 tool_call마다 `extra_content`가 있으면 통과시키도록(제너릭 pass-through; OpenRouter tool_call엔 없음). 실 API 2턴 호출로 검증함(되돌려주면 turn2 OK, 안 하면 400 재현). 리뷰 PASS, 61 passed.
 - 머지 후 실측 확인 포인트: 웹서치 질의 시 툴루프 전 구간이 `served by model gemini-3.5-flash`로 돌고 400/OpenRouter 폴백이 안 나면 성공.
 
-### 현재 상태 요약
-- 번역: Gemini `gemini-3.5-flash` (compat), OpenRouter 폴백. **동작 확인.**
-- 웹서치: Gemini `gemini-3.5-flash` + Tavily 툴루프 (compat), OpenRouter 폴백. thought_signature 수정 머지하면 Gemini가 전 구간 담당.
+### (d) `gemini-3.5-flash` 무료 20 RPD + 종합 실패 → `gemini-flash-lite-latest`로 교체
+- 실측: `gemini-3.5-flash` 무료 한도가 **하루 20건**(`GenerateRequestsPerDayPerProjectPerModel-FreeTier: 20`). 봇 운영엔 못 씀. `gemini-2.0-flash`도 429(무료 quota 낮음/소진). 살아있는 건 `gemini-flash-lite-latest`.
+- 실측: `gemini-3.5-flash`는 웹서치 툴루프에서 **종합을 안 함** — 좋은 검색결과를 먹여도 거의 같은 쿼리로 재검색만 반복(4회 캡) → 강제 최종콜이 빈 응답 → 유저 실패메시지. (thought_signature 수정 자체는 정상 동작, 문제는 모델 행동.)
+- 실측: `gemini-flash-lite-latest`는 **정상 종합** — iter1 검색(thought_signature 있음=Gemini 3 계열) → iter2에서 검색결과로 한국어 답변+출처 완성. 검색 1회, 빠름. → 이 모델이 무료 웹서치의 정답.
+- 수정: `config.GEMINI_MODEL = "gemini-flash-lite-latest"` (번역·웹서치 공통). flash-lite도 thought_signature 계열이라 (c)의 수정이 **필수 전제**. 그래서 (c) thought_signature 수정 + (d) 모델 교체를 `fix/gemini-tool-thought-signature` 한 브랜치로 묶어 함께 머지(3.5-flash+수정이 main에 들어가 웹서치가 빈 답 내는 중간 상태 회피).
+- flash-lite 무료 RPD 정확값은 콘솔(https://aistudio.google.com/rate-limit)에서 확인 권장. 3.5-flash(20)보다는 확실히 큼(종일 테스트에도 살아있었음).
+
+### 현재 상태 요약 (갱신)
+- 번역: Gemini `gemini-flash-lite-latest` (compat), OpenRouter 폴백.
+- 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프 (compat, thought_signature 수정 포함), OpenRouter 폴백.
 - grounding: 무료티어 빌링 게이트로 보류. 유료 전환 시 재검토.
+- 참고: 무료 최신 모델(3.5-flash 20 RPD 등) 한계로, 볼륨이 커지면 결국 유료 전환(OpenRouter $10 이미 충전됨)이 정답. 번역은 OpenRouter gpt-oss로도 무료로 양호.
 
 ### 남은 후속
 - `fix/gemini-tool-thought-signature` 실측 확인 후 머지·push.

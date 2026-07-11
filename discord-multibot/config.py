@@ -78,7 +78,7 @@ DEFAULT_MODEL = DEFAULT_MODEL_CHAIN[0]
 # Primary provider (Google AI Studio, OpenAI-compatible endpoint), used for both
 # translate and websearch when a Gemini API key is configured. OpenRouter is the
 # fallback chain, tried only when Gemini is unavailable or fails.
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = "gemini-flash-lite-latest"
 
 # Allowed values, shared with the slash command choices.
 MODES = ("translate", "websearch")
