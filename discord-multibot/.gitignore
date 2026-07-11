@@ -2,7 +2,12 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # Runtime channel config written by /setup (must not be committed).
 channel_config.json
 .channel_config.*.tmp
+
+# Local-only dev docs (kept in the working tree, not committed).
+HANDOFF.md
+CLAUDE.md
