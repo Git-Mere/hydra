@@ -389,3 +389,67 @@ git push origin feat/gemini-provider            # 이상 없으면
 - 제거 대상: `llm/tavily_search.py`, `complete_with_tools`의 Tavily 관련 경로, `TavilyUnavailable`, `ExceptionGroup` 언랩, `MAX_TOOL_RESULT_CHARS` truncate, `WEBSEARCH_MODEL_CHAIN`/`get_websearch_model_plan`, `TAVILY_API_KEY`. `[websearch-diag]` 로깅도 이때 제거.
 - Gemini 불가(키 없음/에러) 시 `WEBSEARCH_UNAVAILABLE_MESSAGE` 반환(메모리 답변 금지) 유지. OpenRouter 검색 폴백은 없앰.
 - 번역은 이번 `feat/gemini-provider` 그대로.
+
+---
+
+## 15. 세션 4 이어서 (2026-07-11) — 실측 후 모델 교체 + grounding 포기 + 툴루프 수정
+
+`feat/gemini-provider`를 사람이 main에 머지·push 후 실키로 돌려본 결과, 계획이 두 번 바뀜. 전부 main에 머지·push 완료.
+
+### (a) `gemini-2.5-flash` 404 → `gemini-3.5-flash`로 교체 (머지됨, main)
+- 실측: `gemini-2.5-flash`(및 `-lite`)는 신규 키에 404 "no longer available to new users". 그래서 Gemini가 매 호출 404 → 전부 OpenRouter 폴백 중이었음(번역·웹서치 둘 다). **폴백 설계 자체는 실전에서 완벽 동작 확인.**
+- 네 키로 compat 호출 검증: `gemini-3.5-flash`/`gemini-flash-latest`/`gemini-3-flash-preview` = 200, `gemini-2.5-flash-lite` = 404.
+- 수정: `config.GEMINI_MODEL = "gemini-3.5-flash"` (커밋 `aad55f7`). 번역 Gemini 서빙 확인됨(`served by model gemini-3.5-flash`).
+- 무료 한도: Google이 모델별 수치를 콘솔로만 노출(https://aistudio.google.com/rate-limit). flash 계열 대략 10 RPM / 250K TPM / 1,500 RPD 추정. 초과해도 OpenRouter 폴백이라 치명적 아님.
+
+### (b) 웹서치 grounding 마이그레이션 → **포기 (무료티어 빌링 게이트)**
+- 실측: 네 무료 키로 native grounding(`generateContent` + `tools:[{google_search:{}}]`) 첫 호출부터 **429 RESOURCE_EXHAUSTED "check your plan and billing"**. `gemini-3.5-flash`/`gemini-flash-latest` 둘 다 동일. 반면 **툴 없는 일반 generateContent는 정상**. → grounding만 별도 쿼터가 0 = 사실상 빌링 전용.
+- 사용자 결정 유지("무료로 감수") → **grounding 안 감. Tavily 유지.** (14절 grounding 계획은 폐기. 유료 전환 시에만 재검토: Gemini 3 grounding ~$14/1000.)
+
+### (c) 웹서치 Gemini+Tavily 툴루프 수정 — thought_signature (머지 대기: `fix/gemini-tool-thought-signature`, 커밋 `6a3b0ee`)
+- 실측: 웹서치에서 Gemini가 OpenAI 포맷 tool_calls **정상 발생**(HANDOFF 미해결 항목 해소 = 됨). 그러나 iteration 2에서 **400 "Function call is missing a thought_signature in functionCall parts"**.
+- 원인: Gemini 3 계열은 각 tool_call에 `thought_signature`를 붙여줌(compat 응답의 `tool_call.extra_content.google.thought_signature` = `tc.model_extra["extra_content"]`). 다음 턴에 그 assistant 메시지를 되돌려줄 때 이 서명을 같이 보내야 함. `_assistant_message_dict`가 이걸 버려서 400 → OpenRouter(nemotron) 폴백으로 마무리되고 있었음(= 웹서치가 여전히 저품질 무료모델로 답함).
+- 수정: `llm/client.py` `_assistant_message_dict`가 tool_call마다 `extra_content`가 있으면 통과시키도록(제너릭 pass-through; OpenRouter tool_call엔 없음). 실 API 2턴 호출로 검증함(되돌려주면 turn2 OK, 안 하면 400 재현). 리뷰 PASS, 61 passed.
+- 머지 후 실측 확인 포인트: 웹서치 질의 시 툴루프 전 구간이 `served by model gemini-3.5-flash`로 돌고 400/OpenRouter 폴백이 안 나면 성공.
+
+### (d) `gemini-3.5-flash` 무료 20 RPD + 종합 실패 → `gemini-flash-lite-latest`로 교체
+- 실측: `gemini-3.5-flash` 무료 한도가 **하루 20건**(`GenerateRequestsPerDayPerProjectPerModel-FreeTier: 20`). 봇 운영엔 못 씀. `gemini-2.0-flash`도 429(무료 quota 낮음/소진). 살아있는 건 `gemini-flash-lite-latest`.
+- 실측: `gemini-3.5-flash`는 웹서치 툴루프에서 **종합을 안 함** — 좋은 검색결과를 먹여도 거의 같은 쿼리로 재검색만 반복(4회 캡) → 강제 최종콜이 빈 응답 → 유저 실패메시지. (thought_signature 수정 자체는 정상 동작, 문제는 모델 행동.)
+- 실측: `gemini-flash-lite-latest`는 **정상 종합** — iter1 검색(thought_signature 있음=Gemini 3 계열) → iter2에서 검색결과로 한국어 답변+출처 완성. 검색 1회, 빠름. → 이 모델이 무료 웹서치의 정답.
+- 수정: `config.GEMINI_MODEL = "gemini-flash-lite-latest"` (번역·웹서치 공통). flash-lite도 thought_signature 계열이라 (c)의 수정이 **필수 전제**. 그래서 (c) thought_signature 수정 + (d) 모델 교체를 `fix/gemini-tool-thought-signature` 한 브랜치로 묶어 함께 머지(3.5-flash+수정이 main에 들어가 웹서치가 빈 답 내는 중간 상태 회피).
+- flash-lite 무료 RPD 정확값은 콘솔(https://aistudio.google.com/rate-limit)에서 확인 권장. 3.5-flash(20)보다는 확실히 큼(종일 테스트에도 살아있었음).
+
+### (e) flash-lite 번역 불안정 → 번역 프롬프트 하드닝
+- 실측: 웹서치는 flash-lite로 빠르고 정확(출처 종합 OK). 그러나 **번역이 불안정** — 한국어 입력을 그대로 에코하거나("오늘 날씨 어때?"→그대로), 내용을 명령/인사로 오해해 응답("안녕하세요"→"안녕", "한국어로 번역해줘"→명령 수행). lite 모델의 인스트럭션-팔로잉 약점.
+- `gemini-flash-lite-latest`는 실제로 **`gemini-3.1-flash-lite`**로 해석됨. 무료 한도 **15 RPM**(분당, 계속 리셋 — 3.5-flash의 20 RPD보다 훨씬 쓸만). 버스트로 초과하면 OpenRouter 폴백.
+- 수정: `llm/prompts.py`의 `_TRANSLATE_BASE`를 "번역 엔진, 사용자 메시지를 명령/질문/인사가 아닌 '번역 대상 텍스트'로만 취급, 입력과 다른 언어로만 출력, 에코 금지"로 하드닝. 실 API로 13/13 케이스(실패 3개 포함) 통과 검증. 이 프롬프트는 Gemini·OpenRouter 폴백 양쪽에 동일 적용됨(handler가 `get_translate_system` 공용).
+- 톤 규칙(`_TONE_RULES` casual/polite)은 그대로. `get_translate_system`/별칭 그대로.
+
+### (f) 번역 출력을 이중 톤(공손+캐주얼)으로 + tone /setup 파라미터 제거
+- 사용자 요청: 번역 시 **항상 공손+캐주얼 둘 다** 출력, /setup에서 tone 선택 안 하게.
+- 방향 신뢰성 문제: flash-lite에 "자동감지 + 두 레지스터"를 한꺼번에 시키니 방향 오류가 남(정상 문장도 3/10 실패). 해결: **방향을 코드가 판정**(한글 유무: `_contains_korean`, syllables+compat jamo로 "ㅋㅋㅋ"도 커버)하고 모델엔 방향 고정 프롬프트(`TRANSLATE_KO_TO_EN`/`TRANSLATE_EN_TO_KO`)를 줌. 실 API 11/11 통과(adversarial 포함).
+- 출력 형식: 두 줄, `공손: ...` / `캐주얼: ...`.
+- 제거: `config`의 `tone` 필드/`TONES`/`DEFAULT_TONE`, `/setup`의 tone 파라미터, `get_translate_system(tone)`. `_load`는 레거시 `"tone"` 키를 무시(마이그레이션). README도 갱신.
+- 리뷰 PASS(blocking 0), 59 passed.
+
+### (g) 웹서치 프롬프트 개선 — 이중 언어 검색 + 안티할루시네이션 강화
+- 사용자 요청: 할루시네이션 최소·정확도 우선 + 한국어 질문이어도 한국어·영어 각각 검색.
+- `WEBSEARCH_SYSTEM` 재작성: (1) 답변 전 **정확히 2회 검색 강제**(한국어 쿼리 1 + 영어 쿼리 1), 그 후 종합, 과검색 금지(둘이 아무것도 못 찾을 때만 1회 추가). (2) 안티할루시네이션 강화: 결과에 문자 그대로 없는 사실/숫자/이름/URL 금지, 불명확/충돌 시 그대로 밝히기. (3) 한국어 답변, 출처 인용.
+- 실 모델 검증: "벨뷰 시장" → 한국어검색+영어검색 후 양쪽 출처(위키+gov) 인용 종합. "스노퀄미 맛집" → 2검색 후 iter3에서 종합(과검색 없음). MAX_TOOL_ITERATIONS=4로 충분(2검색+종합=3).
+- prompts.py의 `WEBSEARCH_SYSTEM`만 변경. 59 passed.
+
+### 현재 상태 요약 (최신)
+- 번역: 방향 코드판정 → Gemini `gemini-flash-lite-latest`(=gemini-3.1-flash-lite, 15 RPM) 방향고정 이중톤 프롬프트, OpenRouter(gpt-oss) 폴백. 출력=공손+캐주얼 2줄.
+- 웹서치: Gemini flash-lite + Tavily. 프롬프트가 한국어+영어 2회 검색 강제, 안티할루시네이션 강화.
+
+### (h) `[websearch-diag]` 임시 로깅 제거
+- 원인(thought_signature/모델선택/과검색) 다 규명됐으니 임시 계측 제거. `llm/client.py`의 모든 `[websearch-diag]` 로그 + `tool_calls_made` 카운터 + 임시 주석, `llm/tavily_search.py`의 diag 로그 제거. 정상 로그(Empty completion, invalid JSON, Tool failed, iteration-cap, Tavily error 경고)는 보존. diag 검증용 테스트 2개도 삭제. 57 passed.
+- 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프(thought_signature 수정 포함), OpenRouter 폴백. **빠르고 좋음(실측 확인).**
+- grounding: 무료티어 빌링 게이트로 보류.
+- 참고: 무료 최신 모델(3.5-flash 20 RPD) 한계로, 볼륨 커지면 유료 전환(OpenRouter $10 충전됨)이 정답. flash-lite 15 RPM은 소규모엔 충분.
+
+### 남은 후속
+- `fix/gemini-tool-thought-signature` 실측 확인 후 머지·push.
+- `[websearch-diag]` 로깅: 이제 원인(thought_signature) 확정됐으니 제거 또는 DEBUG 다운그레이드 가능. (별도 정리 태스크)
+- 혼합 provider 엣지: Gemini가 루프 도중 429로 OpenRouter로 넘어가면, 직전 Gemini turn의 `extra_content`가 OpenRouter로 감(보통 무시됨). 드문 경로라 방치. 문제되면 non-Gemini 전송 시 strip.
+- 보안: TAVILY/OPENROUTER/GEMINI 키 로테이션 권장(과거 노출).

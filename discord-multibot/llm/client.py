@@ -248,17 +248,26 @@ def complete(plan: list[dict], system_prompt: str, user_message: str) -> str:
 
 def _assistant_message_dict(message) -> dict:
     """Serialise an assistant message carrying tool_calls back into request form."""
+    tool_calls = []
+    for tc in message.tool_calls:
+        entry = {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        # Gemini 3 models (e.g. gemini-3.5-flash) attach a thought_signature to
+        # each tool_call in the OpenAI-compat response under
+        # tool_call.extra_content.google. It MUST be echoed back on the next turn
+        # or the follow-up call 400s ("missing a thought_signature"). Pass through
+        # whatever extra_content the provider gave; OpenRouter tool_calls have none.
+        extra_content = (getattr(tc, "model_extra", None) or {}).get("extra_content")
+        if extra_content:
+            entry["extra_content"] = extra_content
+        tool_calls.append(entry)
     return {
         "role": "assistant",
         "content": message.content or "",
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            }
-            for tc in message.tool_calls
-        ],
+        "tool_calls": tool_calls,
     }
 
 
@@ -289,21 +298,13 @@ async def complete_with_tools(
         {"role": "user", "content": user_message},
     ]
 
-    # [websearch-diag] TEMPORARY instrumentation to see why the tool loop hits
-    # the cap and answers "couldn't find results". Remove once root cause found.
-    tool_calls_made = 0
-
     for iteration in range(1, max_iterations + 1):
-        logger.info("[websearch-diag] iteration %d/%d", iteration, max_iterations)
         message = await asyncio.to_thread(_create_completion, plan, messages, tools)
         if not getattr(message, "tool_calls", None):
             text = (message.content or "").strip()
             if not text:
                 logger.warning("Empty completion from model plan %s", plan)
                 raise LLMError()
-            logger.info(
-                "[websearch-diag] final answer len=%d snippet=%r", len(text), text[:300]
-            )
             return text
 
         messages.append(_assistant_message_dict(message))
@@ -317,11 +318,6 @@ async def complete_with_tools(
             if not valid_args:
                 # Bad tool args: don't call the tool with {} (Tavily would reject
                 # the empty query). Feed the error back so the model retries.
-                logger.info(
-                    "[websearch-diag] tool_call name=%s args=%r",
-                    tc.function.name,
-                    str(tc.function.arguments)[:300],
-                )
                 logger.warning(
                     "Tool %s called with invalid JSON arguments: %r",
                     tc.function.name,
@@ -329,47 +325,25 @@ async def complete_with_tools(
                 )
                 result = f"Tool error: arguments were not valid JSON: {raw_args}"
             else:
-                logger.info(
-                    "[websearch-diag] tool_call name=%s args=%r",
-                    tc.function.name,
-                    str(arguments)[:300],
-                )
                 try:
                     result = await tool_executor(tc.function.name, arguments)
                 except Exception as exc:  # noqa: BLE001 -- keep answering without the tool
                     logger.warning("Tool %s failed: %s", tc.function.name, exc)
                     result = f"Tool error: {exc}"
-            tool_calls_made += 1
             original_len = len(result)
             if original_len > MAX_TOOL_RESULT_CHARS:
                 result = result[:MAX_TOOL_RESULT_CHARS] + (
                     f"\n...[truncated {original_len - MAX_TOOL_RESULT_CHARS} chars]"
                 )
-            logger.info(
-                "[websearch-diag] tool_result name=%s original_len=%d fed_len=%d snippet=%r",
-                tc.function.name,
-                original_len,
-                len(result),
-                result[:300],
-            )
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )
 
     # Cap reached: force a final answer with no further tool calls.
     logger.info("Tool loop hit the %d-iteration cap; forcing a final answer", max_iterations)
-    logger.info(
-        "[websearch-diag] cap reached: %d tool call(s) made across %d iteration(s); "
-        "model never returned a content answer",
-        tool_calls_made,
-        max_iterations,
-    )
     message = await asyncio.to_thread(_create_completion, plan, messages, None)
     text = (message.content or "").strip()
     if not text:
         logger.warning("Empty final completion from model plan %s", plan)
         raise LLMError()
-    logger.info(
-        "[websearch-diag] final answer len=%d snippet=%r", len(text), text[:300]
-    )
     return text

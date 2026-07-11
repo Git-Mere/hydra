@@ -564,9 +564,10 @@ class _FakeFn:
 
 
 class _FakeToolCall:
-    def __init__(self, id, name, arguments):
+    def __init__(self, id, name, arguments, model_extra=None):
         self.id = id
         self.function = _FakeFn(name, arguments)
+        self.model_extra = model_extra
 
 
 class _FakeMsg:
@@ -602,6 +603,21 @@ def test_mcp_tools_to_openai_maps_schemas():
     # A tool with no description / schema still yields a valid object schema.
     fallback = tavily_search.mcp_tools_to_openai([_T("t", None, None)])
     assert fallback[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_assistant_message_dict_passes_through_gemini_thought_signature():
+    extra_content = {"google": {"thought_signature": "SIG"}}
+    msg = _FakeMsg(tool_calls=[
+        _FakeToolCall("c1", "web_search", "{}", model_extra={"extra_content": extra_content})
+    ])
+    out = llm_client._assistant_message_dict(msg)
+    assert out["tool_calls"][0]["extra_content"] == extra_content
+
+
+def test_assistant_message_dict_omits_extra_content_when_absent():
+    msg = _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", "{}")])
+    out = llm_client._assistant_message_dict(msg)
+    assert "extra_content" not in out["tool_calls"][0]
 
 
 def test_tool_loop_executes_and_feeds_back():
@@ -1107,7 +1123,7 @@ def test_store_atomic_write_leaves_no_temp_file():
     with open(path, encoding="utf-8") as f:
         on_disk = json.load(f)
     assert on_disk == {
-        "1": {"2": {"mode": "websearch", "trigger": "auto", "enabled": True, "tone": "casual"}}
+        "1": {"2": {"mode": "websearch", "trigger": "auto", "enabled": True}}
     }
 
 
@@ -1142,50 +1158,18 @@ def test_store_migrates_legacy_chat_mode_to_websearch():
     assert cfg.enabled is True
 
 
-def test_store_load_defaults_tone_casual_when_absent():
-    """A persisted translate channel with no 'tone' key loads as casual (migration)."""
-    path = _tmp_store_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"1": {"2": {"mode": "translate", "trigger": "auto", "enabled": True}}}, f
-        )
-    store = config.JsonStore(path)
-    cfg = store.get(1, 2)
-    assert cfg is not None
-    assert cfg.tone == "casual"
-
-
-def test_store_load_normalizes_invalid_tone_to_casual():
+def test_store_load_ignores_legacy_tone_key():
+    """A persisted config with a stale legacy 'tone' key loads fine; tone is
+    ignored (ChannelConfig no longer has a tone field)."""
     path = _tmp_store_path()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
             {"1": {"2": {"mode": "translate", "trigger": "auto", "enabled": True,
-                         "tone": "bogus"}}}, f
+                         "tone": "polite"}}}, f
         )
-    store = config.JsonStore(path)
-    assert store.get(1, 2).tone == "casual"
-
-
-def test_store_tone_round_trips():
-    path = _tmp_store_path()
-    store = config.JsonStore(path)
-    cfg = store.set(1, 2, "translate", "auto", tone="polite")
-    assert cfg.tone == "polite"
-    assert store.get(1, 2).tone == "polite"
-    # persisted through a reload
-    assert config.JsonStore(path).get(1, 2).tone == "polite"
-
-
-def test_store_disable_preserves_tone():
-    path = _tmp_store_path()
-    store = config.JsonStore(path)
-    store.set(1, 2, "translate", "auto", tone="polite")
-    assert store.disable(1, 2) is True
+    store = config.JsonStore(path)          # must not raise
     cfg = store.get(1, 2)
-    assert cfg.enabled is False
-    assert cfg.tone == "polite"
-    # survives a reload
-    assert config.JsonStore(path).get(1, 2).tone == "polite"
+    assert cfg == config.ChannelConfig("translate", "auto", True)
 
 
 def test_module_wrappers_use_singleton_store():
@@ -1420,7 +1404,7 @@ def test_get_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-3.5-flash"],
+            "models": ["gemini-flash-lite-latest"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1431,7 +1415,7 @@ def test_get_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-3.5-flash"],
+            "models": ["gemini-flash-lite-latest"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1469,7 +1453,7 @@ def test_get_websearch_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_websearch_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-3.5-flash"],
+            "models": ["gemini-flash-lite-latest"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1480,7 +1464,7 @@ def test_get_websearch_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_websearch_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-3.5-flash"],
+            "models": ["gemini-flash-lite-latest"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1519,23 +1503,26 @@ def test_command_tree_builds():
     assert {c.value for c in mode_param.choices} == {"translate", "websearch"}
 
 
-def test_setup_exposes_tone_parameter_with_choices():
+def test_setup_has_no_tone_parameter():
     setup = bot.tree.get_command("setup")
     param_names = {p.name for p in setup.parameters}
-    assert "tone" in param_names
-    tone_param = next(p for p in setup.parameters if p.name == "tone")
-    assert {c.value for c in tone_param.choices} == {"casual", "polite"}
+    assert "tone" not in param_names
 
 
-def test_get_translate_system_selects_by_tone():
+def test_get_translate_system_selects_by_direction():
     from llm import prompts
 
-    casual = prompts.get_translate_system("casual")
-    polite = prompts.get_translate_system("polite")
-    assert casual != polite
-    # unknown tone falls back to casual
-    assert prompts.get_translate_system("bogus") == casual
-    assert prompts.get_translate_system("polite") == polite
+    assert prompts.get_translate_system("안녕하세요") == prompts.TRANSLATE_KO_TO_EN
+    assert prompts.get_translate_system("ㅋㅋㅋ") == prompts.TRANSLATE_KO_TO_EN
+    assert prompts.get_translate_system("hello there") == prompts.TRANSLATE_EN_TO_KO
+
+
+def test_contains_korean():
+    from llm import prompts
+
+    assert prompts._contains_korean("안녕")
+    assert prompts._contains_korean("ㅋㅋㅋ")
+    assert not prompts._contains_korean("hello")
 
 
 class _FakeInteraction:
@@ -1564,93 +1551,6 @@ def test_setup_requires_manage_channels():
         except MissingPermissions:
             raised = True
         assert raised
-
-
-def test_tool_loop_emits_websearch_diag_logs():
-    """[websearch-diag] instrumentation: a successful tool call must log the
-    query args and a truncated tool_result snippet on llm.client.logger."""
-    records = []
-
-    class _Handler(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    handler = _Handler()
-    llm_client.logger.addHandler(handler)
-    previous_level = llm_client.logger.level
-    llm_client.logger.setLevel(logging.INFO)
-
-    responses = [
-        _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", '{"query": "Mayor of Redmond"}')]),
-        _FakeMsg(content="The mayor is ..."),
-    ]
-    seen = []
-
-    def fake_create(models, messages, tools=None):
-        seen.append(tools)
-        return responses[len(seen) - 1]
-
-    async def executor(name, arguments):
-        return "Angela Birney is the Mayor of Redmond"
-
-    prev = llm_client._create_completion
-    llm_client._create_completion = fake_create
-    try:
-        out = asyncio.run(
-            llm_client.complete_with_tools(_plan(["m"]), "sys", "q", _DUMMY_TOOLS, executor)
-        )
-    finally:
-        llm_client._create_completion = prev
-        llm_client.logger.removeHandler(handler)
-        llm_client.logger.setLevel(previous_level)
-
-    assert out == "The mayor is ..."
-    messages = [r.getMessage() for r in records]
-    # The query the model sent is visible in a tool_call diag record.
-    assert any("[websearch-diag] tool_call" in m and "Mayor of Redmond" in m for m in messages)
-    # What was fed back to the model is visible in a tool_result diag record.
-    assert any("[websearch-diag] tool_result" in m and "Angela Birney" in m for m in messages)
-
-
-def test_tavily_executor_success_path_emits_websearch_diag_log():
-    """[websearch-diag] instrumentation: the tavily executor success path logs a
-    'tavily result' record with the returned text snippet."""
-    records = []
-
-    class _Handler(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    handler = _Handler()
-    tavily_search.logger.addHandler(handler)
-    prev_level = tavily_search.logger.level
-    tavily_search.logger.setLevel(logging.INFO)
-
-    class _OkMcpSession(_FakeMcpSession):
-        async def call_tool(self, name, arguments):
-            return _FakeCallResult(["Angela Birney is the Mayor of Redmond"], is_error=False)
-
-    prev_key = _set_tavily_key()
-    prev_http = tavily_search.streamablehttp_client
-    prev_session_cls = tavily_search.ClientSession
-    tavily_search.streamablehttp_client = lambda url: _FakeHttpClient(url)
-    tavily_search.ClientSession = _OkMcpSession
-
-    async def run():
-        async with tavily_search.session() as (tools, executor):
-            return await executor("tavily_search", {"query": "Mayor of Redmond"})
-
-    try:
-        out = asyncio.run(run())
-        assert "Angela Birney" in out
-        messages = [r.getMessage() for r in records]
-        assert any("[websearch-diag] tavily result" in m and "Angela Birney" in m for m in messages)
-    finally:
-        tavily_search.streamablehttp_client = prev_http
-        tavily_search.ClientSession = prev_session_cls
-        _restore_tavily_key(prev_key)
-        tavily_search.logger.removeHandler(handler)
-        tavily_search.logger.setLevel(prev_level)
 
 
 if __name__ == "__main__":

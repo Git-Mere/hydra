@@ -3,9 +3,9 @@
 One Discord bot that behaves differently **per channel** — different mode and
 trigger — all routed through a single [OpenRouter](https://openrouter.ai) key.
 
-- **translate** mode: translates messages (Korean ↔ English) into a single most
-  natural sentence, in the channel's configured **tone** (casual/반말 or
-  polite/존댓말), applied in both directions.
+- **translate** mode: translates messages (Korean ↔ English), always giving
+  **both** a polite (공손/존댓말) and a casual (캐주얼/반말) version on two labeled
+  lines. Direction is auto-detected from the input language.
 - **web searching** mode: answers questions in Korean **strictly from web
   search** via [Tavily](https://tavily.com)'s remote MCP server for
   current/verifiable facts (weather, prices, traffic rules, news, ...). It never
@@ -111,13 +111,13 @@ There is no per-channel model. Every channel uses one model, read from the
 
 In the channel you want the bot to act in, run:
 
-- **`/setup mode:<translate|websearch> trigger:<auto|mention> [tone:<casual|polite>]`** —
-  enables the bot in the current channel. Discord shows pickers for `mode`,
-  `trigger`, and the optional `tone`.
+- **`/setup mode:<translate|websearch> trigger:<auto|mention>`** —
+  enables the bot in the current channel. Discord shows pickers for `mode` and
+  `trigger`.
   - `trigger: auto` → the bot responds to every (meaningful) message.
   - `trigger: mention` → the bot responds only when `@mentioned`.
-  - `tone` (optional, translate mode only) → `casual` (반말) or `polite` (존댓말);
-    applied in both directions. Defaults to `casual`. Ignored for websearch mode.
+  - translate mode always outputs both a polite and a casual version, so there
+    is no tone option to choose.
 - **`/setup-off`** — disables the bot in the current channel.
 
 Both commands reply with an **ephemeral** confirmation (only you see it) and
