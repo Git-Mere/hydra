@@ -1123,7 +1123,7 @@ def test_store_atomic_write_leaves_no_temp_file():
     with open(path, encoding="utf-8") as f:
         on_disk = json.load(f)
     assert on_disk == {
-        "1": {"2": {"mode": "websearch", "trigger": "auto", "enabled": True, "tone": "casual"}}
+        "1": {"2": {"mode": "websearch", "trigger": "auto", "enabled": True}}
     }
 
 
@@ -1158,50 +1158,18 @@ def test_store_migrates_legacy_chat_mode_to_websearch():
     assert cfg.enabled is True
 
 
-def test_store_load_defaults_tone_casual_when_absent():
-    """A persisted translate channel with no 'tone' key loads as casual (migration)."""
-    path = _tmp_store_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"1": {"2": {"mode": "translate", "trigger": "auto", "enabled": True}}}, f
-        )
-    store = config.JsonStore(path)
-    cfg = store.get(1, 2)
-    assert cfg is not None
-    assert cfg.tone == "casual"
-
-
-def test_store_load_normalizes_invalid_tone_to_casual():
+def test_store_load_ignores_legacy_tone_key():
+    """A persisted config with a stale legacy 'tone' key loads fine; tone is
+    ignored (ChannelConfig no longer has a tone field)."""
     path = _tmp_store_path()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
             {"1": {"2": {"mode": "translate", "trigger": "auto", "enabled": True,
-                         "tone": "bogus"}}}, f
+                         "tone": "polite"}}}, f
         )
-    store = config.JsonStore(path)
-    assert store.get(1, 2).tone == "casual"
-
-
-def test_store_tone_round_trips():
-    path = _tmp_store_path()
-    store = config.JsonStore(path)
-    cfg = store.set(1, 2, "translate", "auto", tone="polite")
-    assert cfg.tone == "polite"
-    assert store.get(1, 2).tone == "polite"
-    # persisted through a reload
-    assert config.JsonStore(path).get(1, 2).tone == "polite"
-
-
-def test_store_disable_preserves_tone():
-    path = _tmp_store_path()
-    store = config.JsonStore(path)
-    store.set(1, 2, "translate", "auto", tone="polite")
-    assert store.disable(1, 2) is True
+    store = config.JsonStore(path)          # must not raise
     cfg = store.get(1, 2)
-    assert cfg.enabled is False
-    assert cfg.tone == "polite"
-    # survives a reload
-    assert config.JsonStore(path).get(1, 2).tone == "polite"
+    assert cfg == config.ChannelConfig("translate", "auto", True)
 
 
 def test_module_wrappers_use_singleton_store():
@@ -1535,23 +1503,26 @@ def test_command_tree_builds():
     assert {c.value for c in mode_param.choices} == {"translate", "websearch"}
 
 
-def test_setup_exposes_tone_parameter_with_choices():
+def test_setup_has_no_tone_parameter():
     setup = bot.tree.get_command("setup")
     param_names = {p.name for p in setup.parameters}
-    assert "tone" in param_names
-    tone_param = next(p for p in setup.parameters if p.name == "tone")
-    assert {c.value for c in tone_param.choices} == {"casual", "polite"}
+    assert "tone" not in param_names
 
 
-def test_get_translate_system_selects_by_tone():
+def test_get_translate_system_selects_by_direction():
     from llm import prompts
 
-    casual = prompts.get_translate_system("casual")
-    polite = prompts.get_translate_system("polite")
-    assert casual != polite
-    # unknown tone falls back to casual
-    assert prompts.get_translate_system("bogus") == casual
-    assert prompts.get_translate_system("polite") == polite
+    assert prompts.get_translate_system("안녕하세요") == prompts.TRANSLATE_KO_TO_EN
+    assert prompts.get_translate_system("ㅋㅋㅋ") == prompts.TRANSLATE_KO_TO_EN
+    assert prompts.get_translate_system("hello there") == prompts.TRANSLATE_EN_TO_KO
+
+
+def test_contains_korean():
+    from llm import prompts
+
+    assert prompts._contains_korean("안녕")
+    assert prompts._contains_korean("ㅋㅋㅋ")
+    assert not prompts._contains_korean("hello")
 
 
 class _FakeInteraction:
