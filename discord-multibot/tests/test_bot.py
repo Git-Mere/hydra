@@ -564,9 +564,10 @@ class _FakeFn:
 
 
 class _FakeToolCall:
-    def __init__(self, id, name, arguments):
+    def __init__(self, id, name, arguments, model_extra=None):
         self.id = id
         self.function = _FakeFn(name, arguments)
+        self.model_extra = model_extra
 
 
 class _FakeMsg:
@@ -602,6 +603,21 @@ def test_mcp_tools_to_openai_maps_schemas():
     # A tool with no description / schema still yields a valid object schema.
     fallback = tavily_search.mcp_tools_to_openai([_T("t", None, None)])
     assert fallback[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_assistant_message_dict_passes_through_gemini_thought_signature():
+    extra_content = {"google": {"thought_signature": "SIG"}}
+    msg = _FakeMsg(tool_calls=[
+        _FakeToolCall("c1", "web_search", "{}", model_extra={"extra_content": extra_content})
+    ])
+    out = llm_client._assistant_message_dict(msg)
+    assert out["tool_calls"][0]["extra_content"] == extra_content
+
+
+def test_assistant_message_dict_omits_extra_content_when_absent():
+    msg = _FakeMsg(tool_calls=[_FakeToolCall("c1", "web_search", "{}")])
+    out = llm_client._assistant_message_dict(msg)
+    assert "extra_content" not in out["tool_calls"][0]
 
 
 def test_tool_loop_executes_and_feeds_back():

@@ -248,17 +248,26 @@ def complete(plan: list[dict], system_prompt: str, user_message: str) -> str:
 
 def _assistant_message_dict(message) -> dict:
     """Serialise an assistant message carrying tool_calls back into request form."""
+    tool_calls = []
+    for tc in message.tool_calls:
+        entry = {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        # Gemini 3 models (e.g. gemini-3.5-flash) attach a thought_signature to
+        # each tool_call in the OpenAI-compat response under
+        # tool_call.extra_content.google. It MUST be echoed back on the next turn
+        # or the follow-up call 400s ("missing a thought_signature"). Pass through
+        # whatever extra_content the provider gave; OpenRouter tool_calls have none.
+        extra_content = (getattr(tc, "model_extra", None) or {}).get("extra_content")
+        if extra_content:
+            entry["extra_content"] = extra_content
+        tool_calls.append(entry)
     return {
         "role": "assistant",
         "content": message.content or "",
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            }
-            for tc in message.tool_calls
-        ],
+        "tool_calls": tool_calls,
     }
 
 
