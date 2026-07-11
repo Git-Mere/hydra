@@ -432,8 +432,15 @@ git push origin feat/gemini-provider            # 이상 없으면
 - 제거: `config`의 `tone` 필드/`TONES`/`DEFAULT_TONE`, `/setup`의 tone 파라미터, `get_translate_system(tone)`. `_load`는 레거시 `"tone"` 키를 무시(마이그레이션). README도 갱신.
 - 리뷰 PASS(blocking 0), 59 passed.
 
+### (g) 웹서치 프롬프트 개선 — 이중 언어 검색 + 안티할루시네이션 강화
+- 사용자 요청: 할루시네이션 최소·정확도 우선 + 한국어 질문이어도 한국어·영어 각각 검색.
+- `WEBSEARCH_SYSTEM` 재작성: (1) 답변 전 **정확히 2회 검색 강제**(한국어 쿼리 1 + 영어 쿼리 1), 그 후 종합, 과검색 금지(둘이 아무것도 못 찾을 때만 1회 추가). (2) 안티할루시네이션 강화: 결과에 문자 그대로 없는 사실/숫자/이름/URL 금지, 불명확/충돌 시 그대로 밝히기. (3) 한국어 답변, 출처 인용.
+- 실 모델 검증: "벨뷰 시장" → 한국어검색+영어검색 후 양쪽 출처(위키+gov) 인용 종합. "스노퀄미 맛집" → 2검색 후 iter3에서 종합(과검색 없음). MAX_TOOL_ITERATIONS=4로 충분(2검색+종합=3).
+- prompts.py의 `WEBSEARCH_SYSTEM`만 변경. 59 passed.
+
 ### 현재 상태 요약 (최신)
 - 번역: 방향 코드판정 → Gemini `gemini-flash-lite-latest`(=gemini-3.1-flash-lite, 15 RPM) 방향고정 이중톤 프롬프트, OpenRouter(gpt-oss) 폴백. 출력=공손+캐주얼 2줄.
+- 웹서치: Gemini flash-lite + Tavily. 프롬프트가 한국어+영어 2회 검색 강제, 안티할루시네이션 강화.
 - 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프(thought_signature 수정 포함), OpenRouter 폴백. **빠르고 좋음(실측 확인).**
 - grounding: 무료티어 빌링 게이트로 보류.
 - 참고: 무료 최신 모델(3.5-flash 20 RPD) 한계로, 볼륨 커지면 유료 전환(OpenRouter $10 충전됨)이 정답. flash-lite 15 RPM은 소규모엔 충분.
