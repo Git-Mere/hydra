@@ -419,11 +419,17 @@ git push origin feat/gemini-provider            # 이상 없으면
 - 수정: `config.GEMINI_MODEL = "gemini-flash-lite-latest"` (번역·웹서치 공통). flash-lite도 thought_signature 계열이라 (c)의 수정이 **필수 전제**. 그래서 (c) thought_signature 수정 + (d) 모델 교체를 `fix/gemini-tool-thought-signature` 한 브랜치로 묶어 함께 머지(3.5-flash+수정이 main에 들어가 웹서치가 빈 답 내는 중간 상태 회피).
 - flash-lite 무료 RPD 정확값은 콘솔(https://aistudio.google.com/rate-limit)에서 확인 권장. 3.5-flash(20)보다는 확실히 큼(종일 테스트에도 살아있었음).
 
-### 현재 상태 요약 (갱신)
-- 번역: Gemini `gemini-flash-lite-latest` (compat), OpenRouter 폴백.
-- 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프 (compat, thought_signature 수정 포함), OpenRouter 폴백.
-- grounding: 무료티어 빌링 게이트로 보류. 유료 전환 시 재검토.
-- 참고: 무료 최신 모델(3.5-flash 20 RPD 등) 한계로, 볼륨이 커지면 결국 유료 전환(OpenRouter $10 이미 충전됨)이 정답. 번역은 OpenRouter gpt-oss로도 무료로 양호.
+### (e) flash-lite 번역 불안정 → 번역 프롬프트 하드닝
+- 실측: 웹서치는 flash-lite로 빠르고 정확(출처 종합 OK). 그러나 **번역이 불안정** — 한국어 입력을 그대로 에코하거나("오늘 날씨 어때?"→그대로), 내용을 명령/인사로 오해해 응답("안녕하세요"→"안녕", "한국어로 번역해줘"→명령 수행). lite 모델의 인스트럭션-팔로잉 약점.
+- `gemini-flash-lite-latest`는 실제로 **`gemini-3.1-flash-lite`**로 해석됨. 무료 한도 **15 RPM**(분당, 계속 리셋 — 3.5-flash의 20 RPD보다 훨씬 쓸만). 버스트로 초과하면 OpenRouter 폴백.
+- 수정: `llm/prompts.py`의 `_TRANSLATE_BASE`를 "번역 엔진, 사용자 메시지를 명령/질문/인사가 아닌 '번역 대상 텍스트'로만 취급, 입력과 다른 언어로만 출력, 에코 금지"로 하드닝. 실 API로 13/13 케이스(실패 3개 포함) 통과 검증. 이 프롬프트는 Gemini·OpenRouter 폴백 양쪽에 동일 적용됨(handler가 `get_translate_system` 공용).
+- 톤 규칙(`_TONE_RULES` casual/polite)은 그대로. `get_translate_system`/별칭 그대로.
+
+### 현재 상태 요약 (최신)
+- 번역: Gemini `gemini-flash-lite-latest`(=gemini-3.1-flash-lite, 15 RPM) + 하드닝 프롬프트, OpenRouter(gpt-oss) 폴백.
+- 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프(thought_signature 수정 포함), OpenRouter 폴백. **빠르고 좋음(실측 확인).**
+- grounding: 무료티어 빌링 게이트로 보류.
+- 참고: 무료 최신 모델(3.5-flash 20 RPD) 한계로, 볼륨 커지면 유료 전환(OpenRouter $10 충전됨)이 정답. flash-lite 15 RPM은 소규모엔 충분.
 
 ### 남은 후속
 - `fix/gemini-tool-thought-signature` 실측 확인 후 머지·push.
