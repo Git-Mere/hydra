@@ -1420,7 +1420,7 @@ def test_get_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-2.5-flash"],
+            "models": ["gemini-3.5-flash"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1431,7 +1431,7 @@ def test_get_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-2.5-flash"],
+            "models": ["gemini-3.5-flash"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1469,7 +1469,7 @@ def test_get_websearch_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_websearch_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-2.5-flash"],
+            "models": ["gemini-3.5-flash"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
@@ -1480,7 +1480,7 @@ def test_get_websearch_model_plan_prepends_gemini_batch_when_key_present():
         plan = config.get_websearch_model_plan()
         assert plan[0] == {
             "provider": "gemini",
-            "models": ["gemini-2.5-flash"],
+            "models": ["gemini-3.5-flash"],
             "reasoning": None,
         }
         assert plan[1:] == openrouter_only_plan
