@@ -102,15 +102,6 @@ async def session():
                         text,
                     )
                     return f"Tool error: {text or '(no details)'}"
-                # [websearch-diag] TEMPORARY: reveal what Tavily returned on the
-                # success path so we can see why the model reports "no results".
-                # Remove once the tool-loop cap root cause is found.
-                logger.info(
-                    "[websearch-diag] tavily result for %s: len=%d snippet=%r",
-                    str(arguments)[:300],
-                    len(text or ""),
-                    (text or "")[:300],
-                )
                 return text or "(no result)"
 
             yield schemas, executor

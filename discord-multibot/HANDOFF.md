@@ -441,6 +441,9 @@ git push origin feat/gemini-provider            # 이상 없으면
 ### 현재 상태 요약 (최신)
 - 번역: 방향 코드판정 → Gemini `gemini-flash-lite-latest`(=gemini-3.1-flash-lite, 15 RPM) 방향고정 이중톤 프롬프트, OpenRouter(gpt-oss) 폴백. 출력=공손+캐주얼 2줄.
 - 웹서치: Gemini flash-lite + Tavily. 프롬프트가 한국어+영어 2회 검색 강제, 안티할루시네이션 강화.
+
+### (h) `[websearch-diag]` 임시 로깅 제거
+- 원인(thought_signature/모델선택/과검색) 다 규명됐으니 임시 계측 제거. `llm/client.py`의 모든 `[websearch-diag]` 로그 + `tool_calls_made` 카운터 + 임시 주석, `llm/tavily_search.py`의 diag 로그 제거. 정상 로그(Empty completion, invalid JSON, Tool failed, iteration-cap, Tavily error 경고)는 보존. diag 검증용 테스트 2개도 삭제. 57 passed.
 - 웹서치: Gemini `gemini-flash-lite-latest` + Tavily 툴루프(thought_signature 수정 포함), OpenRouter 폴백. **빠르고 좋음(실측 확인).**
 - grounding: 무료티어 빌링 게이트로 보류.
 - 참고: 무료 최신 모델(3.5-flash 20 RPD) 한계로, 볼륨 커지면 유료 전환(OpenRouter $10 충전됨)이 정답. flash-lite 15 RPM은 소규모엔 충분.
