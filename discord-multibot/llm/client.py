@@ -30,6 +30,7 @@ from openai import APIError
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 REQUEST_TIMEOUT = 30.0        # seconds
 MAX_RETRIES = 3               # full-chain passes on 429 before giving up
 BACKOFF_BASE = 2.0           # seconds; sleep = BACKOFF_BASE * 2**attempt
@@ -85,6 +86,26 @@ def _get_client() -> OpenAI:
     return _client
 
 
+_gemini_client: Optional[OpenAI] = None
+
+
+def _get_gemini_client() -> OpenAI:
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise LLMError(USER_FACING_ERROR)
+
+        _gemini_client = OpenAI(
+            base_url=GEMINI_BASE_URL,
+            api_key=api_key,
+            timeout=REQUEST_TIMEOUT,
+            # We own the retry loop below, so disable the SDK's own retries.
+            max_retries=0,
+        )
+    return _gemini_client
+
+
 def _retry_after_seconds(exc: RateLimitError, attempt: int) -> float:
     """Return bounded 429 backoff, preferring server Retry-After hints."""
     response = getattr(exc, "response", None)
@@ -124,7 +145,6 @@ def _create_completion(plan: list[dict], messages: list[dict], tools: Optional[l
     on rate-limit exhaustion, timeout, or any API error. This is the single
     place the 429/timeout policy lives; both complete() and the tool loop use it.
     """
-    client = _get_client()
     if not plan:
         raise LLMError()
     last_exc: Optional[Exception] = None
@@ -133,17 +153,28 @@ def _create_completion(plan: list[dict], messages: list[dict], tools: Optional[l
         for batch in plan:
             models = batch["models"]
             reasoning = batch.get("reasoning")
+            provider = batch.get("provider", "openrouter")
             try:
-                extra_body = {"models": models}
-                if reasoning:
-                    extra_body["reasoning"] = reasoning
-                kwargs = {
-                    "model": models[0],
-                    "messages": messages,
-                    "extra_body": extra_body,
-                }
-                if tools:
-                    kwargs["tools"] = tools
+                if provider == "gemini":
+                    client = _get_gemini_client()
+                    kwargs = {
+                        "model": models[0],
+                        "messages": messages,
+                    }
+                    if tools:
+                        kwargs["tools"] = tools
+                else:
+                    client = _get_client()
+                    extra_body = {"models": models}
+                    if reasoning:
+                        extra_body["reasoning"] = reasoning
+                    kwargs = {
+                        "model": models[0],
+                        "messages": messages,
+                        "extra_body": extra_body,
+                    }
+                    if tools:
+                        kwargs["tools"] = tools
                 resp = client.chat.completions.create(**kwargs)
                 if resp is None or not getattr(resp, "choices", None):
                     # OpenRouter sometimes returns HTTP 200 whose body is an
@@ -172,12 +203,14 @@ def _create_completion(plan: list[dict], messages: list[dict], tools: Optional[l
                 continue
 
             except APITimeoutError as exc:
+                last_exc = exc
                 logger.warning("OpenRouter request timed out: %s", exc)
-                raise LLMError() from exc
+                continue
 
             except APIError as exc:
+                last_exc = exc
                 logger.error("OpenRouter API error: %s", exc)
-                raise LLMError() from exc
+                continue
 
         # No point sleeping after the final full-chain pass.
         if attempt < MAX_RETRIES - 1:

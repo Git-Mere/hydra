@@ -191,6 +191,33 @@ class _NullChoicesFakeCompletions:
         return response
 
 
+class _CapturingFakeCompletions:
+    """Records the exact kwargs passed to create() (no fixed signature), so
+    tests can assert a key like 'extra_body' is entirely absent rather than
+    merely None."""
+
+    def __init__(self, reply="ok", served_model="served-model"):
+        self.reply = reply
+        self.served_model = served_model
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class _Msg:
+            content = self.reply
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        response = _Resp()
+        response.model = self.served_model
+        return response
+
+
 class _FakeClient:
     def __init__(self, fake_completions):
         self.chat = type("Chat", (), {"completions": fake_completions})()
@@ -447,6 +474,81 @@ def test_served_model_not_logged_for_null_choices():
     finally:
         llm_client.logger.removeHandler(handler)
         llm_client.logger.setLevel(previous_level)
+        llm_client._client = None
+
+
+def _restore_gemini_key_env(prev_gemini):
+    if prev_gemini is None:
+        os.environ.pop("GEMINI_API_KEY", None)
+    else:
+        os.environ["GEMINI_API_KEY"] = prev_gemini
+
+
+def test_create_completion_gemini_batch_sends_no_extra_body():
+    """A gemini-provider batch must call the gemini client with no extra_body
+    key at all, while an openrouter batch still sends extra_body with models."""
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    try:
+        os.environ["GEMINI_API_KEY"] = "test-key"
+        gemini_fc = _CapturingFakeCompletions(reply="gemini reply")
+        llm_client._gemini_client = _FakeClient(gemini_fc)
+        openrouter_fc = _BatchFakeCompletions(fail_batches=[], reply="openrouter reply")
+        _install_fake_client(openrouter_fc)
+
+        gemini_batch = {"provider": "gemini", "models": [config.GEMINI_MODEL], "reasoning": None}
+        message = llm_client._create_completion(
+            [gemini_batch], [{"role": "user", "content": "hi"}]
+        )
+        assert (message.content or "").strip() == "gemini reply"
+        assert len(gemini_fc.calls) == 1
+        assert gemini_fc.calls[0]["model"] == config.GEMINI_MODEL
+        assert "extra_body" not in gemini_fc.calls[0]
+
+        openrouter_batch = {"models": ["m1"], "reasoning": None}
+        message = llm_client._create_completion(
+            [openrouter_batch], [{"role": "user", "content": "hi"}]
+        )
+        assert (message.content or "").strip() == "openrouter reply"
+        assert "extra_body" in openrouter_fc.calls[-1]
+        assert openrouter_fc.calls[-1]["extra_body"]["models"] == ["m1"]
+    finally:
+        _restore_gemini_key_env(prev_gemini)
+        llm_client._gemini_client = None
+        llm_client._client = None
+
+
+def test_create_completion_gemini_failure_falls_through_to_openrouter():
+    """When the gemini batch fails (e.g. an APIError), the loop must fall
+    through to the next (openrouter) batch instead of raising immediately."""
+    import httpx
+    from openai import APIError
+
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    try:
+        os.environ["GEMINI_API_KEY"] = "test-key"
+
+        class _FailingGeminiCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                raise APIError("boom", httpx.Request("POST", "http://x"), body=None)
+
+        gemini_fc = _FailingGeminiCompletions()
+        llm_client._gemini_client = _FakeClient(gemini_fc)
+        openrouter_fc = _BatchFakeCompletions(fail_batches=[], reply="from openrouter")
+        _install_fake_client(openrouter_fc)
+
+        gemini_batch = {"provider": "gemini", "models": [config.GEMINI_MODEL], "reasoning": None}
+        openrouter_batch = {"models": ["m1"], "reasoning": None}
+        out = llm_client.complete([gemini_batch, openrouter_batch], "sys", "hi")
+        assert out == "from openrouter"
+        assert gemini_fc.calls == 1
+        assert len(openrouter_fc.calls) == 1
+    finally:
+        _restore_gemini_key_env(prev_gemini)
+        llm_client._gemini_client = None
         llm_client._client = None
 
 
@@ -1290,6 +1392,117 @@ def test_model_plan_unknown_ids_map_to_no_reasoning_and_slice_by_three():
         ]
     finally:
         _restore_model_env(prev_default, prev_chain)
+
+
+def _restore_gemini_env(prev_gemini, prev_google):
+    if prev_gemini is None:
+        os.environ.pop("GEMINI_API_KEY", None)
+    else:
+        os.environ["GEMINI_API_KEY"] = prev_gemini
+    if prev_google is None:
+        os.environ.pop("GOOGLE_API_KEY", None)
+    else:
+        os.environ["GOOGLE_API_KEY"] = prev_google
+
+
+def test_get_model_plan_prepends_gemini_batch_when_key_present():
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    prev_google = os.environ.get("GOOGLE_API_KEY")
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        openrouter_only_plan = config._build_plan(config.get_model_chain())
+
+        os.environ.pop("GOOGLE_API_KEY", None)
+        os.environ["GEMINI_API_KEY"] = "key"
+        plan = config.get_model_plan()
+        assert plan[0] == {
+            "provider": "gemini",
+            "models": ["gemini-2.5-flash"],
+            "reasoning": None,
+        }
+        assert plan[1:] == openrouter_only_plan
+
+        # GOOGLE_API_KEY alone is also accepted.
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ["GOOGLE_API_KEY"] = "key"
+        plan = config.get_model_plan()
+        assert plan[0] == {
+            "provider": "gemini",
+            "models": ["gemini-2.5-flash"],
+            "reasoning": None,
+        }
+        assert plan[1:] == openrouter_only_plan
+    finally:
+        _restore_gemini_env(prev_gemini, prev_google)
+        _restore_model_env(prev_default, prev_chain)
+
+
+def test_get_model_plan_no_gemini_batch_without_key():
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    prev_google = os.environ.get("GOOGLE_API_KEY")
+    prev_default = os.environ.get("DEFAULT_MODEL")
+    prev_chain = os.environ.get("MODEL_CHAIN")
+    try:
+        os.environ.pop("DEFAULT_MODEL", None)
+        os.environ.pop("MODEL_CHAIN", None)
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GOOGLE_API_KEY", None)
+        assert config.get_model_plan() == config._build_plan(config.get_model_chain())
+    finally:
+        _restore_gemini_env(prev_gemini, prev_google)
+        _restore_model_env(prev_default, prev_chain)
+
+
+def test_get_websearch_model_plan_prepends_gemini_batch_when_key_present():
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    prev_google = os.environ.get("GOOGLE_API_KEY")
+    prev_ws = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    try:
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+        openrouter_only_plan = config._build_plan(config.get_websearch_model_chain())
+
+        os.environ.pop("GOOGLE_API_KEY", None)
+        os.environ["GEMINI_API_KEY"] = "key"
+        plan = config.get_websearch_model_plan()
+        assert plan[0] == {
+            "provider": "gemini",
+            "models": ["gemini-2.5-flash"],
+            "reasoning": None,
+        }
+        assert plan[1:] == openrouter_only_plan
+
+        # GOOGLE_API_KEY alone is also accepted.
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ["GOOGLE_API_KEY"] = "key"
+        plan = config.get_websearch_model_plan()
+        assert plan[0] == {
+            "provider": "gemini",
+            "models": ["gemini-2.5-flash"],
+            "reasoning": None,
+        }
+        assert plan[1:] == openrouter_only_plan
+    finally:
+        _restore_gemini_env(prev_gemini, prev_google)
+        _restore_websearch_chain_env(prev_ws)
+
+
+def test_get_websearch_model_plan_no_gemini_batch_without_key():
+    prev_gemini = os.environ.get("GEMINI_API_KEY")
+    prev_google = os.environ.get("GOOGLE_API_KEY")
+    prev_ws = os.environ.get("WEBSEARCH_MODEL_CHAIN")
+    try:
+        os.environ.pop("WEBSEARCH_MODEL_CHAIN", None)
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GOOGLE_API_KEY", None)
+        assert config.get_websearch_model_plan() == config._build_plan(
+            config.get_websearch_model_chain()
+        )
+    finally:
+        _restore_gemini_env(prev_gemini, prev_google)
+        _restore_websearch_chain_env(prev_ws)
 
 
 # --- Slash commands / app_commands tree --------------------------------------

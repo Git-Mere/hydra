@@ -75,6 +75,11 @@ MAX_FALLBACK_MODELS = 3
 # Backward-compatible module-level fallback constant.
 DEFAULT_MODEL = DEFAULT_MODEL_CHAIN[0]
 
+# Primary provider (Google AI Studio, OpenAI-compatible endpoint), used for both
+# translate and websearch when a Gemini API key is configured. OpenRouter is the
+# fallback chain, tried only when Gemini is unavailable or fails.
+GEMINI_MODEL = "gemini-2.5-flash"
+
 # Allowed values, shared with the slash command choices.
 MODES = ("translate", "websearch")
 TRIGGERS = ("auto", "mention")
@@ -147,14 +152,27 @@ def _build_plan(chain: list[str]) -> list[dict]:
     return plan
 
 
+def _gemini_available() -> bool:
+    """Return True iff a Gemini API key is configured via either env var."""
+    return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+
+
 def get_model_plan() -> list[dict]:
-    """Return the translate model chain as reasoning-consistent batches."""
-    return _build_plan(get_model_chain())
+    """Return the translate model plan: Gemini first (if configured), then the
+    OpenRouter chain as reasoning-consistent batches."""
+    plan = _build_plan(get_model_chain())
+    if _gemini_available():
+        plan = [{"provider": "gemini", "models": [GEMINI_MODEL], "reasoning": None}] + plan
+    return plan
 
 
 def get_websearch_model_plan() -> list[dict]:
-    """Return the websearch model chain as reasoning-consistent batches."""
-    return _build_plan(get_websearch_model_chain())
+    """Return the websearch model plan: Gemini first (if configured), then the
+    OpenRouter chain as reasoning-consistent batches."""
+    plan = _build_plan(get_websearch_model_chain())
+    if _gemini_available():
+        plan = [{"provider": "gemini", "models": [GEMINI_MODEL], "reasoning": None}] + plan
+    return plan
 
 
 @dataclass(frozen=True)
