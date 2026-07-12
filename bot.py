@@ -185,17 +185,27 @@ async def on_app_command_error(
     logger.exception("Unhandled app command error", exc_info=error)
 
 
+async def _sync_guild(guild: discord.Guild) -> None:
+    # Guild-scoped sync for instant propagation (global sync can take ~1h).
+    try:
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+        logger.info("Synced app commands to guild %s (%s)", guild.name, guild.id)
+    except discord.DiscordException:
+        logger.exception("Failed to sync commands to guild %s", guild.id)
+
+
 @client.event
 async def on_ready() -> None:
     logger.info("Logged in as %s (id=%s)", client.user, client.user.id if client.user else "?")
-    # Guild-scoped sync for instant propagation (global sync can take ~1h).
     for guild in client.guilds:
-        try:
-            tree.copy_global_to(guild=guild)
-            await tree.sync(guild=guild)
-            logger.info("Synced app commands to guild %s (%s)", guild.name, guild.id)
-        except discord.DiscordException:
-            logger.exception("Failed to sync commands to guild %s", guild.id)
+        await _sync_guild(guild)
+
+
+@client.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    # Sync commands when invited at runtime, so /setup appears without a restart.
+    await _sync_guild(guild)
 
 
 @client.event
