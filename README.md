@@ -30,7 +30,7 @@ This is transparent per request: the served model is logged as
 ## Directory layout
 
 ```
-discord-multibot/
+.
 ├── bot.py               # entrypoint: client + /setup, /setup-off + on_message flow
 ├── config.py            # JSON config store + model plans (Gemini-first, OpenRouter fallback)
 ├── channel_config.json  # runtime config (gitignored, created by /setup)
@@ -42,6 +42,7 @@ discord-multibot/
 │   ├── translate.py     # single-shot, no tools
 │   └── websearch.py     # agentic web-search tool loop (Tavily MCP)
 ├── tests/test_bot.py
+├── initial-design.md    # original design spec
 ├── .env.example
 └── pyproject.toml
 ```
@@ -76,7 +77,6 @@ discord-multibot/
 ## 3. Install and run
 
 ```bash
-cd discord-multibot
 uv sync                   # creates .venv and installs dependencies
 
 cp .env.example .env      # then edit .env with your real tokens/keys
@@ -116,8 +116,6 @@ Typical usage:
 ## 5. Verify
 
 ```bash
-cd discord-multibot
-
 # compile / import check (no tokens needed)
 uv run python -m compileall bot.py config.py llm handlers
 
