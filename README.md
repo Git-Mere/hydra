@@ -1,141 +1,108 @@
 # Discord Multi-Bot
 
-One Discord bot that behaves differently **per channel**. Each channel is given
-a **mode** (what the bot does) and a **trigger** (when it responds) at runtime
-with the `/setup` slash command — no file editing, no restart.
+A single Discord bot that runs multiple modes per channel, configured at runtime with a slash command — no restarts, no file edits.
 
-- **translate** mode: translates messages between Korean and English. Direction
-  is auto-detected from the input, and the bot always returns **both** a polite
-  (공손/존댓말) and a casual (캐주얼/반말) version on two labeled lines.
-- **web searching** mode: answers a question in Korean **strictly from web
-  search** (via [Tavily](https://tavily.com)'s remote MCP server). It searches
-  once in Korean and once in English to cross-check sources, and answers only
-  from the results with cited URLs — if search finds nothing or is unavailable,
-  it says so instead of inventing facts.
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
 
-## LLM providers
+## Features
 
-All LLM calls go through one wrapper (`llm/client.py`) with automatic fallback:
+- **Per-channel mode assignment** via `/setup` — switch between `translate` and `websearch` modes and trigger types without editing config files or restarting the process.
+- **Bidirectional translation** — auto-detects Korean or English input and returns both a polite (존댓말) and casual (반말) version on labeled lines in a single reply.
+- **Grounded web search** — answers questions strictly from Tavily search results (queried in both Korean and English for cross-validation), with cited URLs; refuses to answer from model memory when search is unavailable.
+- **Transparent LLM fallback** — Gemini `flash-lite` is the primary model; any rate-limit or error falls through automatically to an OpenRouter free-model chain, logged per request.
+- **Config isolation** — channel settings are stored in a JSON file keyed by `(guild_id, channel_id)` with atomic writes and loaded into memory at startup; the storage backend can be swapped without touching bot logic.
 
-- **Gemini (primary)** — when `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) is set, the
-  bot uses `gemini-flash-lite-latest` through Google's OpenAI-compatible
-  endpoint for both modes.
-- **OpenRouter (fallback)** — if Gemini is unset or a call fails (rate limit,
-  error), the request falls through to an OpenRouter free-model chain. With no
-  Gemini key, everything runs on OpenRouter.
+## Demo
 
-This is transparent per request: the served model is logged as
-`... completion served by model <id>`.
+No screenshots yet. Once a channel is configured, it behaves like this.
 
-## Directory layout
+**Translate channel** — `/setup mode:translate trigger:auto`
 
-```
-.
-├── bot.py               # entrypoint: client + /setup, /setup-off + on_message flow
-├── config.py            # JSON config store + model plans (Gemini-first, OpenRouter fallback)
-├── channel_config.json  # runtime config (gitignored, created by /setup)
-├── llm/
-│   ├── client.py        # provider routing, 429 backoff, timeout, tool loop
-│   ├── tavily_search.py # Tavily MCP client (web searching mode)
-│   └── prompts.py       # translate (dual-tone, direction-fixed) + websearch prompts
-├── handlers/
-│   ├── translate.py     # single-shot, no tools
-│   └── websearch.py     # agentic web-search tool loop (Tavily MCP)
-├── tests/test_bot.py
-├── initial-design.md    # original design spec
-├── .env.example
-└── pyproject.toml
-```
+> **You:** Could you review this by tomorrow?
+>
+> **Bot:**
+> `공손:` 내일까지 검토해 주실 수 있을까요?
+> `캐주얼:` 내일까지 검토해 줄 수 있어?
 
-## 1. Create the Discord bot
+Direction is auto-detected from the input, and both tones are always returned on their own labeled line.
 
-1. [Discord Developer Portal](https://discord.com/developers/applications) →
-   **New Application**.
-2. **Bot** tab → copy the **token** into `.env` as `DISCORD_TOKEN`.
-3. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**.
-   Without it the bot receives empty message content and nothing works.
-4. **OAuth2 → URL Generator**: select **both** scopes `bot` **and**
-   `applications.commands` (the second is required for slash commands to
-   appear). Permissions: `View Channels`, `Send Messages`. Open the generated
-   URL to invite the bot.
+**Web search channel** — `/setup mode:websearch trigger:mention`
 
-   **If you invited the bot before slash commands existed, re-invite it** with
-   the `applications.commands` scope, or `/setup` will not register.
+> **You:** @bot 오늘 서울 날씨?
+>
+> **Bot:** a Korean answer assembled only from Tavily search results, with the source URLs cited. If search returns nothing or is unavailable, it says so instead of answering from model memory.
 
-## 2. Get API keys
+## Built With
 
-- **Gemini (recommended primary)** — [Google AI Studio](https://aistudio.google.com/apikey).
-  Put it in `.env` as `GEMINI_API_KEY`. Free tier is usable but rate-limited
-  (roughly 15 requests/minute for `flash-lite`); bursts over the limit fall back
-  to OpenRouter automatically.
-- **OpenRouter (required fallback)** — [openrouter.ai/keys](https://openrouter.ai/keys),
-  key looks like `sk-or-...`, goes in `.env` as `OPENROUTER_API_KEY`. Free
-  models are shared across all channels and are rate-limited.
-- **Tavily (optional, for web searching)** — [app.tavily.com](https://app.tavily.com),
-  goes in `.env` as `TAVILY_API_KEY`.
+- **Python** — sole implementation language; all async I/O runs on the discord.py event loop.
+- **discord.py** — chosen for its first-class `app_commands` slash-command support and per-guild sync, so `/setup` appears in Discord immediately after inviting the bot without a global propagation delay.
+- **Google Gemini (`gemini-flash-lite-latest`)** — primary LLM via Google's OpenAI-compatible endpoint; the free tier handles the single-turn translation and bounded websearch workload at acceptable latency.
+- **OpenRouter** — fallback LLM gateway that provides access to multiple free models; used transparently when Gemini is absent or rate-limited, so no single provider outage silences the bot.
+- **Tavily MCP** — remote MCP server for web search; returns structured, cited results that the websearch handler surfaces directly, making the anti-hallucination constraint enforceable.
+- **uv** — fast Python package manager that creates the virtual environment and installs dependencies reproducibly from `uv.lock` in a single command.
 
-## 3. Install and run
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) installed
+- A Discord bot token with **MESSAGE CONTENT INTENT** enabled and both `bot` + `applications.commands` OAuth2 scopes granted
+- At least one of `GEMINI_API_KEY` or `OPENROUTER_API_KEY`
+
+### Installation
 
 ```bash
-uv sync                   # creates .venv and installs dependencies
+# Clone the repo
+git clone https://github.com/Git-Mere/hydra.git
+cd hydra
 
-cp .env.example .env      # then edit .env with your real tokens/keys
+# Install dependencies into a managed virtual environment
+uv sync
+
+# Copy the example env file and fill in your tokens
+cp .env.example .env
+```
+
+### Running
+
+```bash
 uv run python bot.py
 ```
 
-See `.env.example` for every supported variable, including optional model-chain
-overrides (`MODEL_CHAIN`, `DEFAULT_MODEL`, `WEBSEARCH_MODEL_CHAIN`) and optional
-OpenRouter attribution headers.
-
-## 4. Configure channels with `/setup`
-
-In the target channel, run:
-
-- **`/setup mode:<translate|websearch> trigger:<auto|mention>`** — enables the
-  bot in the current channel.
-  - `trigger: auto` → responds to every (meaningful) message.
-  - `trigger: mention` → responds only when `@mentioned`.
-  - Translate mode always outputs both a polite and a casual version, so there
-    is no tone to choose.
-- **`/setup-off`** — disables the bot in the current channel.
-
-Both commands require the **Manage Channels** permission (enforced server-side)
-and reply with an **ephemeral** confirmation. Config is written to
-`channel_config.json` (keyed by guild → channel) with an atomic write and loaded
-into memory at startup; the file is gitignored runtime data. On startup the bot
-syncs commands **per guild** so `/setup` is usable immediately after inviting.
-
-Typical usage:
-
-- **translate** channel: `mode:translate trigger:auto` — every message is
-  translated (Korean → English / English → Korean), both tones shown.
-- **web searching** channel: `mode:websearch trigger:mention` — `@bot 오늘 서울
-  날씨?` returns a search-backed Korean answer with sources; a plain message is
-  ignored.
-
-## 5. Verify
+### Verify without a Discord token
 
 ```bash
-# compile / import check (no tokens needed)
+# Compile / import check
 uv run python -m compileall bot.py config.py llm handlers
 
-# tests
+# Unit tests
 uv run --with pytest python -m pytest -q
 ```
 
-Then in Discord: set up a translate channel and a websearch channel as above,
-confirm translations show both tones, a mentioned websearch query returns a
-cited Korean answer, `/setup-off` stops responses, and a member without Manage
-Channels gets a permission error.
+### Configuring channels
 
-## Notes
+In any channel the bot can see, run one of:
 
-- **No cross-message history.** Translate is single-shot; the web-search tool
-  loop lives entirely within one message (bounded to a few model↔tool
-  round-trips).
-- **Anti-hallucination.** Web searching answers only from search results and
-  refuses to answer from model memory when search is unavailable. Translate mode
-  never uses tools.
-- **Config isolation.** All config access is in `config.py` (JSON store keyed by
-  `(guild_id, channel_id)`), so the storage backend can change without touching
-  the rest of the bot.
+```
+/setup mode:translate trigger:auto
+/setup mode:websearch trigger:mention
+/setup-off
+```
+
+`trigger:auto` responds to every message; `trigger:mention` responds only when `@mentioned`. Both commands require the **Manage Channels** permission and reply with an ephemeral confirmation.
+
+## What I Learned
+
+**Centralising LLM routing so call-site code stays provider-agnostic.**
+The bot needs to keep working when Gemini hits its free-tier rate limit mid-use. Rather than scattering `try/except` blocks across handlers, I routed every completion through a single `llm/client.py` wrapper. The wrapper detects 429 responses and falls through to an OpenRouter free-model chain, logging which model actually served each request. The concrete payoff: `handlers/translate.py` and `handlers/websearch.py` are completely unaware of which provider ran — they just receive a completion string.
+
+**Bounding an agentic tool loop inside a single Discord interaction.**
+The websearch handler runs a model↔tool loop (query Tavily → read results → optionally re-query in the other language) that must resolve before Discord's response window closes. I constrained the loop to a fixed maximum number of round-trips rather than letting the model decide when to stop. This prevented unbounded API spend and kept response latency predictable, while still allowing the cross-language validation that makes the search more reliable.
+
+**Enforcing an anti-hallucination contract at the prompt boundary.**
+Free-tier LLMs will confidently answer from training data when a tool returns nothing. The websearch system prompt explicitly tells the model to report that search found nothing rather than falling back to model memory — and the prompt is the only layer where this constraint can live reliably, since the handler has no post-hoc way to verify facts. Getting this right required understanding exactly what the model sees: if Tavily returns an empty result set, the prompt surfaces that emptiness explicitly rather than silently omitting it.
+
+## License
+
+No license specified.
