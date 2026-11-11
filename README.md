@@ -4,6 +4,12 @@ A single Discord bot that runs multiple modes per channel, configured at runtime
 
 ![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
 
+## Highlights
+
+- One bot, per-channel modes (bidirectional translation or grounded web search) set with a slash command, no restart
+- Runs on free-tier models: one LLM wrapper falls through a chain of up to 7 models on 2 providers (Gemini, then OpenRouter)
+- Cut web-search replies from about 140 s to 6-23 s by capping each search or extract result at 6K characters
+
 ## Features
 
 - **Per-channel mode assignment** via `/setup` — switch between `translate` and `websearch` modes and trigger types without editing config files or restarting the process.
